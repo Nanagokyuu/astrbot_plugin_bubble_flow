@@ -1,0 +1,108 @@
+{
+  "enabled": {
+    "description": "启用交错合批与多气泡节奏控制",
+    "hint": "总开关。关闭后本插件所有拦截、合批与气泡塑形逻辑立即旁路，仅保留状态查询 API。",
+    "type": "bool",
+    "default": true
+  },
+  "channels": {
+    "description": "生效会话范围",
+    "type": "object",
+    "items": {
+      "enable_private": {
+        "description": "对私聊生效",
+        "type": "bool",
+        "default": true
+      },
+      "enable_group": {
+        "description": "对群聊生效",
+        "hint": "大多数群聊已有单独的发言准入控制，建议按需开启。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  },
+  "coalesce": {
+    "description": "入站连发合批与防交错配置",
+    "type": "object",
+    "items": {
+      "idle_debounce_seconds": {
+        "description": "空闲首条短防抖（秒）",
+        "hint": "设为 0 表示交由宿主或上游插件（如 Companion）先防抖，本插件只拦截飞行期间的新插话；无前置防抖插件时建议设为 1.0~1.5。",
+        "type": "float",
+        "default": 0.0
+      },
+      "trailing_quiet_seconds": {
+        "description": "在途合批尾音等待（秒）",
+        "hint": "上一轮回复发完后，略微等待用户是否还在补充下一句再合并进入同一轮 LLM。",
+        "type": "float",
+        "default": 0.6
+      },
+      "trailing_max_wait_seconds": {
+        "description": "在途合批最长总等待（秒）",
+        "hint": "无论用户继续连敲多少句，上一轮结束后最多再等这么久即强制并包放行。",
+        "type": "float",
+        "default": 1.8
+      },
+      "max_flight_seconds": {
+        "description": "单轮飞行锁超时兜底（秒）",
+        "hint": "防止模型或下游发送异常导致会话永久卡死。",
+        "type": "float",
+        "default": 45.0
+      },
+      "coalesce_images": {
+        "description": "合批时无损合并图片与引用片段",
+        "hint": "开启后，在途期间发来的文字、图片和引用消息按原序合并进同一轮多模态请求，防止图片抢跑错位。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "bubbles": {
+    "description": "出站多气泡塑形配置",
+    "type": "object",
+    "items": {
+      "max_bubbles": {
+        "description": "单轮回复最多保留的气泡段数",
+        "hint": "超过该段数的后续文本会优雅并入最后一段，减少刷屏和被插话概率。",
+        "type": "int",
+        "default": 2
+      },
+      "collapse_on_interrupt": {
+        "description": "检测到在途插话时立即折叠为单气泡",
+        "hint": "若回复生成期间对方已发来新消息，立即收口成一条发完并释放通道，迅速进入下一轮合批回应。",
+        "type": "bool",
+        "default": true
+      },
+      "min_bubble_chars": {
+        "description": "最小气泡长度阈值（字）",
+        "hint": "短于该长度的零碎短行（如“嗯”“好”）自动贴合到相邻气泡，避免无意义的碎片连发。",
+        "type": "int",
+        "default": 4
+      },
+      "dedup_identical_bubbles": {
+        "description": "消除连续重复气泡",
+        "type": "bool",
+        "default": true
+      },
+      "bubble_sep": {
+        "description": "同气泡内部合并分隔符",
+        "hint": "多个短句合进同一个气泡时中间使用的分隔符（默认换行，支持配合 AstrBot 分段规则）。",
+        "type": "string",
+        "default": "\n"
+      }
+    }
+  },
+  "prompts": {
+    "description": "合批上下文轻提示",
+    "type": "object",
+    "items": {
+      "inject_coalesce_hint": {
+        "description": "为合批请求注入轻提示",
+        "hint": "当多条在途消息合并进入单次请求时，告知模型一次性承接最新语境并避免重复刚才已经发过的回应。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  }
+}
