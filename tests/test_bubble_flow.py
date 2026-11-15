@@ -515,3 +515,39 @@ def test_plugin_watchdog_auto_releases_stalled_turn() -> None:
             await plugin.terminate()
 
     asyncio.run(_run())
+
+
+def test_intake_priority_and_upstream_suppressed_events_bypassed() -> None:
+    from astrbot.core.star.star_handler import star_handlers_registry
+
+    matched = [
+        h
+        for h in star_handlers_registry
+        if getattr(h, "handler_name", "") == "handle_interleave_intake"
+        and (
+            "main" in getattr(h, "handler_module_path", "")
+            or "bubble_flow" in getattr(h, "handler_module_path", "")
+        )
+    ]
+    assert matched, "Expected handle_interleave_intake handler to be registered"
+    assert matched[-1].extras_configs.get("priority", 0) <= -240000
+
+    async def _run() -> None:
+        plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
+        umo = "aiocqhttp:FriendMessage:8888"
+        try:
+            # Event suppressed by an upstream debouncer (call_llm=True in AstrBot means skip default LLM)
+            suppressed_evt = _FakeEvent(umo, "merged follow-up")
+            suppressed_evt.call_llm = True  # type: ignore[attr-defined]
+            await plugin.handle_interleave_intake(suppressed_evt)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
+
+            # Event already answered by upstream plugin (_has_send_oper=True)
+            handled_evt = _FakeEvent(umo, "already handled")
+            handled_evt._has_send_oper = True  # type: ignore[attr-defined]
+            await plugin.handle_interleave_intake(handled_evt)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())

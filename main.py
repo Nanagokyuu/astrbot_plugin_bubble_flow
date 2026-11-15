@@ -328,12 +328,14 @@ class BubbleFlowPlugin(Star):
 
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE | filter.EventMessageType.GROUP_MESSAGE,
-        priority=-50,
+        priority=-250000,
     )
     async def handle_interleave_intake(self, event: AstrMessageEvent) -> None:
         """Admit an idle message immediately, debounce, or coalesce mid-flight bursts."""
         is_stopped = getattr(event, "is_stopped", None)
         if callable(is_stopped) and is_stopped():
+            return
+        if bool(getattr(event, "call_llm", False)) or bool(getattr(event, "_has_send_oper", False)):
             return
 
         umo = getattr(event, "unified_msg_origin", "") or ""
