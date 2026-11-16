@@ -352,6 +352,8 @@ class BubbleFlowPlugin(Star):
         msg = _extract_captured_message(
             event, policy, received_at=self.coordinator._clock()
         )
+        if not msg.text and not msg.image_components and not any(_is_image_component(c) for c in msg.extra_components):
+            return
         adm = await self.coordinator.admit_or_coalesce(umo, msg, policy=policy)
         effective_mode = adm.mode
         effective_token = adm.token

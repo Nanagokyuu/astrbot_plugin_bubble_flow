@@ -483,6 +483,10 @@ def test_plugin_hooks_end_to_end_coalesce_collapse_and_empty_release() -> None:
             assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
             assert await plugin.extension_api.force_release(umo) is True
             assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
+            # Empty-text non-media event never acquires flight lock
+            blank_evt = _FakeEvent(umo, "")
+            await plugin.handle_interleave_intake(blank_evt)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
         finally:
             await plugin.terminate()
 
@@ -511,6 +515,10 @@ def test_plugin_watchdog_auto_releases_stalled_turn() -> None:
             await asyncio.sleep(0.12)
             assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
             assert "turn.watchdog_released" in events
+            # Empty-text non-media event never acquires flight lock
+            blank_evt = _FakeEvent(umo, "")
+            await plugin.handle_interleave_intake(blank_evt)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
         finally:
             await plugin.terminate()
 
@@ -546,6 +554,10 @@ def test_intake_priority_and_upstream_suppressed_events_bypassed() -> None:
             handled_evt = _FakeEvent(umo, "already handled")
             handled_evt._has_send_oper = True  # type: ignore[attr-defined]
             await plugin.handle_interleave_intake(handled_evt)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
+            # Empty-text non-media event never acquires flight lock
+            blank_evt = _FakeEvent(umo, "")
+            await plugin.handle_interleave_intake(blank_evt)
             assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
         finally:
             await plugin.terminate()
