@@ -61,10 +61,14 @@ def _get_event_meta(event: Any, key: str, default: Any = None) -> Any:
 
 def _detect_channel_type(event: Any) -> str:
     is_private = getattr(event, "is_private_chat", None)
+    explicit_non_private = False
     if callable(is_private):
         try:
-            if is_private():
+            res = is_private()
+            if res is True:
                 return "private"
+            if res is False:
+                explicit_non_private = True
         except Exception:
             pass
     msg_type_getter = getattr(event, "get_message_type", None)
@@ -80,7 +84,12 @@ def _detect_channel_type(event: Any) -> str:
             pass
     if getattr(event, "group_id", None):
         return "group"
-    if getattr(event, "unified_msg_origin", ""):
+    umo = str(getattr(event, "unified_msg_origin", "") or "")
+    if ":GroupMessage:" in umo or ":group:" in umo.lower():
+        return "group"
+    if explicit_non_private:
+        return "group"
+    if umo:
         return "private"
     return "unknown"
 
@@ -326,6 +335,19 @@ class BubbleFlowPlugin(Star):
             if task and not task.done():
                 task.cancel()
 
+    async def _release_turn_slot(
+        self, umo: str, token: str, *, empty_result: bool = False
+    ) -> None:
+        if not umo:
+            return
+        self._cancel_watchdog(umo, token)
+        released = await self.coordinator.release_flight(umo, token)
+        if released:
+            await self.extension_api.emit_event(
+                "turn.finished",
+                {"umo": umo, "token": token, "empty_result": empty_result},
+            )
+
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE | filter.EventMessageType.GROUP_MESSAGE,
         priority=-250000,
@@ -347,6 +369,8 @@ class BubbleFlowPlugin(Star):
 
         policy, channel_type = self._resolve_event_policy(event, umo)
         if not self._is_channel_active(policy, channel_type):
+            return
+        if channel_type == "group" and getattr(event, "is_at_or_wake_command", None) is False:
             return
 
         msg = _extract_captured_message(
@@ -492,23 +516,20 @@ class BubbleFlowPlugin(Star):
         result = getattr(event, "get_result", lambda: None)()
         chain = getattr(result, "chain", None) if result is not None else None
         if result is None or not chain:
-            self._cancel_watchdog(umo, token)
-            released = await self.coordinator.release_flight(umo, token)
-            if released:
-                await self.extension_api.emit_event(
-                    "turn.finished", {"umo": umo, "token": token, "empty_result": True}
-                )
+            await self._release_turn_slot(umo, token, empty_result=True)
             return
 
         is_model_fn = getattr(result, "is_model_result", None)
         llm_started = bool(_get_event_meta(event, _META_LLM_STARTED, False))
         if callable(is_model_fn) and not is_model_fn() and not llm_started:
+            await self._release_turn_slot(umo, token, empty_result=False)
             return
 
         policy: BubblePolicy = _get_event_meta(event, _META_POLICY) or (
             self.extension_api.get_session_policy(umo, event)
         )
         if not policy.enabled:
+            await self._release_turn_slot(umo, token, empty_result=False)
             return
 
         leading_comps: list[Any] = []
@@ -532,6 +553,7 @@ class BubbleFlowPlugin(Star):
                 trailing_comps.append(comp)
 
         if not raw_texts:
+            await self._release_turn_slot(umo, token, empty_result=False)
             return
 
         interrupted = self.coordinator.has_pending_interrupt(umo)
@@ -577,19 +599,23 @@ class BubbleFlowPlugin(Star):
                 },
             )
 
+        sent_plain = getattr(event, "get_extra", lambda *_: None)(
+            "_send_message_to_user_current_session_plain_texts", ()
+        )
+        result_plain = (
+            result.get_plain_text().strip()
+            if callable(getattr(result, "get_plain_text", None))
+            else ""
+        )
+        if result_plain and isinstance(sent_plain, list) and result_plain in sent_plain:
+            await self._release_turn_slot(umo, token, empty_result=False)
+
     @filter.after_message_sent(priority=-100)
     async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
         """Release the active turn slot after all segmented bubbles are sent."""
         umo = getattr(event, "unified_msg_origin", "") or ""
         token = _get_event_meta(event, _META_TOKEN, "")
-        if not umo:
-            return
-        self._cancel_watchdog(umo, token)
-        released = await self.coordinator.release_flight(umo, token)
-        if released:
-            await self.extension_api.emit_event(
-                "turn.finished", {"umo": umo, "token": token, "empty_result": False}
-            )
+        await self._release_turn_slot(umo, token, empty_result=False)
 
     async def terminate(self) -> None:
         """Cancel background watchdogs and release coordinator resources."""

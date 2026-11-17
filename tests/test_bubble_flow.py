@@ -563,3 +563,47 @@ def test_intake_priority_and_upstream_suppressed_events_bypassed() -> None:
             await plugin.terminate()
 
     asyncio.run(_run())
+
+
+def test_non_wake_group_chat_and_early_result_release_never_stall() -> None:
+    async def _run() -> None:
+        plugin = BubbleFlowPlugin(
+            _FakeContext([]),
+            {"enabled": True, "channels": {"enable_private": True, "enable_group": True}},
+        )
+        group_umo = "elle:GroupMessage:1091795017"
+        priv_umo = "elle:FriendMessage:577866846"
+        try:
+            # 1. Non-wake casual group chatter (is_at_or_wake_command=False) must NOT lock group flight
+            casual = _FakeEvent(group_umo, "有人打音游吗", channel="group")
+            casual.is_at_or_wake_command = False  # type: ignore[attr-defined]
+            await plugin.handle_interleave_intake(casual)
+            assert plugin.extension_api.get_session_state(group_umo)["in_flight"] is False
+
+            # 2. Woken group message (is_at_or_wake_command=True) DOES acquire flight
+            woken = _FakeEvent(group_umo, "在干嘛", channel="group")
+            woken.is_at_or_wake_command = True  # type: ignore[attr-defined]
+            await plugin.handle_interleave_intake(woken)
+            assert plugin.extension_api.get_session_state(group_umo)["in_flight"] is True
+            # Non-model command result in shape_outgoing_bubbles releases flight immediately
+            cmd_res = MessageEventResult().message("status ok")
+            cmd_res.result_content_type = ResultContentType.GENERAL_RESULT
+            woken.set_result(cmd_res)
+            await plugin.shape_outgoing_bubbles(woken)
+            assert plugin.extension_api.get_session_state(group_umo)["in_flight"] is False
+
+            # 3. Non-text image-only LLM result releases flight instead of waiting for watchdog
+            evt_img = _FakeEvent(priv_umo, "发图")
+            await plugin.handle_interleave_intake(evt_img)
+            assert plugin.extension_api.get_session_state(priv_umo)["in_flight"] is True
+            await plugin.inject_coalesce_context(evt_img, ProviderRequest(prompt="发图"))
+            img_res = MessageEventResult()
+            img_res.chain = [Image.fromFileSystem(__file__)]
+            img_res.result_content_type = ResultContentType.LLM_RESULT
+            evt_img.set_result(img_res)
+            await plugin.shape_outgoing_bubbles(evt_img)
+            assert plugin.extension_api.get_session_state(priv_umo)["in_flight"] is False
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())
