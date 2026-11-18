@@ -348,7 +348,10 @@ class BubbleFlowPlugin(Star):
     async def _release_turn_slot(
         self, umo: str, token: str, *, empty_result: bool = False
     ) -> None:
-        if not umo:
+        # Only the turn that owns a flight token may release it. Tokenless
+        # events (upstream call_llm/send_oper handlers, suppressed triggers,
+        # early-skipped intake) must never cancel another turn's flight lock.
+        if not umo or not token:
             return
         self._cancel_watchdog(umo, token)
         released = await self.coordinator.release_flight(umo, token)

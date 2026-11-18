@@ -896,11 +896,19 @@ def test_idle_preemption_url_cn_punct_dunder_and_tokenless_after_sent() -> None:
         finally:
             await coord.close()
 
-        # 3. Tokenless event in on_after_message_sent is a safe no-op
+        # 3. Tokenless event must not release another turn's active flight lock
         plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
         try:
-            ev = _FakeEvent(umo, "无token事件")
-            await plugin.on_after_message_sent(ev)
+            active = _FakeEvent(umo, "正在生成的这一轮")
+            await plugin.handle_interleave_intake(active)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
+
+            tokenless = _FakeEvent(umo, "无token的上游事件")
+            await plugin.on_after_message_sent(tokenless)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
+
+            # The owning event can still release its own slot normally.
+            await plugin.on_after_message_sent(active)
             assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
         finally:
             await plugin.terminate()
