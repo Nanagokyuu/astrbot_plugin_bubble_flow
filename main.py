@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
 from astrbot.api.provider import ProviderRequest
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 
 from .api import (
@@ -24,6 +25,7 @@ from .coordinator import (
     BurstBatch,
     CapturedMessage,
     SessionFlightCoordinator,
+    clean_plain_bubble_text,
     default_coalesce_prompt,
     plan_outgoing_bubbles,
 )
@@ -32,6 +34,7 @@ _META_TOKEN = "_bubble_flow_token"
 _META_BATCH = "_bubble_flow_batch"
 _META_POLICY = "_bubble_flow_policy"
 _META_LLM_STARTED = "_bubble_flow_llm_started"
+_META_FOLLOWUP_AFTER_INTERRUPT = "_bubble_flow_followup_after_interrupt"
 
 
 def _set_event_meta(event: Any, key: str, value: Any) -> None:
@@ -252,12 +255,19 @@ async def _resolve_image_ref(img: Any) -> str | None:
     return None
 
 
-@register(
-    PLUGIN_ID,
-    "Nanagokyuu",
-    "Generic turn-flight burst coalescing & multi-bubble shaping plugin",
-    "0.1.0",
-)
+def _image_ref_norm_keys(ref: str) -> tuple[str, ...]:
+    val = str(ref or "").strip()
+    if not val:
+        return ()
+    keys = [val]
+    if not val.startswith(("http://", "https://", "data:", "base64://")):
+        try:
+            keys.append(str(Path(val).resolve()))
+        except Exception:
+            pass
+    return tuple(keys)
+
+
 class BubbleFlowPlugin(Star):
     """AstrBot plugin managing burst coalescing and multi-bubble pacing."""
 
@@ -473,18 +483,27 @@ class BubbleFlowPlugin(Star):
         if batch is None:
             return
 
+        if batch.last_reply_preview:
+            _set_event_meta(event, _META_FOLLOWUP_AFTER_INTERRUPT, True)
+
         if not (req.prompt or "").strip() and batch.merged_text:
             req.prompt = batch.merged_text
 
         if policy.coalesce_images and batch.merged_images:
             if req.image_urls is None:
                 req.image_urls = []
-            existing = set(req.image_urls)
+            existing_keys: set[str] = set()
+            for r in req.image_urls:
+                existing_keys.update(_image_ref_norm_keys(r))
             for img in batch.merged_images:
                 ref = await _resolve_image_ref(img)
-                if ref and ref not in existing:
-                    req.image_urls.append(ref)
-                    existing.add(ref)
+                if not ref:
+                    continue
+                norm_keys = _image_ref_norm_keys(ref)
+                if any(k in existing_keys for k in norm_keys):
+                    continue
+                req.image_urls.append(ref)
+                existing_keys.update(norm_keys)
 
         if policy.inject_coalesce_hint and (
             batch.count > 1 or batch.last_reply_preview or len(batch.merged_images) > 1
@@ -514,6 +533,14 @@ class BubbleFlowPlugin(Star):
             return
 
         result = getattr(event, "get_result", lambda: None)()
+        rct = getattr(result, "result_content_type", None) if result is not None else None
+        rct_name = str(getattr(rct, "name", "") or rct or "")
+        if "STREAMING_FINISH" in rct_name:
+            await self._release_turn_slot(umo, token, empty_result=False)
+            return
+        if "STREAMING_RESULT" in rct_name:
+            return
+
         chain = getattr(result, "chain", None) if result is not None else None
         if result is None or not chain:
             await self._release_turn_slot(umo, token, empty_result=True)
@@ -540,7 +567,12 @@ class BubbleFlowPlugin(Star):
         for comp in chain:
             if _is_plain_component(comp):
                 saw_plain = True
-                text_val = str(getattr(comp, "text", "") or "")
+                text_val = clean_plain_bubble_text(
+                    str(getattr(comp, "text", "") or ""),
+                    strip_markdown=policy.strip_markdown,
+                    strip_trailing_period=policy.strip_trailing_period,
+                    split_on_cn_period=policy.split_on_cn_period,
+                )
                 lines = [ln.strip() for ln in text_val.splitlines() if ln.strip()]
                 if lines:
                     raw_texts.extend(lines)
@@ -557,7 +589,12 @@ class BubbleFlowPlugin(Star):
             return
 
         interrupted = self.coordinator.has_pending_interrupt(umo)
-        planned = plan_outgoing_bubbles(raw_texts, policy=policy, interrupted=interrupted)
+        effective_policy = (
+            policy.with_overrides({"max_bubbles": 1})
+            if _get_event_meta(event, _META_FOLLOWUP_AFTER_INTERRUPT, False)
+            else policy
+        )
+        planned = plan_outgoing_bubbles(raw_texts, policy=effective_policy, interrupted=interrupted)
         planned = self.extension_api.apply_bubble_filters(
             planned,
             BubbleFilterContext(

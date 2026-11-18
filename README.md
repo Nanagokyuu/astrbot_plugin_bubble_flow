@@ -8,10 +8,13 @@ When a user sends several consecutive messages (text, images, or reply quotes) w
 
 - **Zero External Dependencies**: Works standalone in any AstrBot instance; requires no third-party companion or persona plugin.
 - **Turn-Flight Interleave Prevention**:
-  - Hooks `@filter.event_message_type` (`priority=-50`) to ensure at most one active generation + delivery pipeline per `umo`.
+  - Hooks `@filter.event_message_type` (`priority=-250000`) to ensure at most one active generation + delivery pipeline per `umo`.
   - Optional standalone idle debounce (`coalesce.idle_debounce_seconds`) or co-existence with upstream debouncers (`0.0` default).
-  - Swallows mid-flight duplicates cleanly and flushes them as one ordered `BurstBatch` (`text + Image + Reply`) after `after_message_sent`.
+  - Swallows mid-flight duplicates cleanly and flushes them as one ordered `BurstBatch` (`text + Image + Reply`) after `after_message_sent` (or `STREAMING_FINISH` in streaming mode).
   - Watchdog timeout (`max_flight_seconds`) + manual `force_release(umo)` prevent deadlocks if a turn aborts early.
+- **Host Prerequisites & Delivery Modes**:
+  - **Multi-bubble delivery**: AstrBot sends multiple `Plain` segments as separate chat bubbles only when `platform_settings.segmented_reply.enable = true` (default is `false` in AstrBot). When enabled, AstrBot's segmented reply regex also splits individual segments by punctuation, so `max_bubbles` controls the planned segment count rather than a hard platform packet cap.
+  - **Streaming responses (`streaming_response = true`)**: Streaming chunks bypass `after_message_sent` in AstrBot; `bubble_flow` preserves the flight lock during `STREAMING_RESULT` and releases it on `STREAMING_FINISH` so follow-up turns do not stall until the watchdog timeout.
 - **Multi-Bubble Shaping**:
   - Caps maximum bubbles per turn (`bubbles.max_bubbles`).
   - Merges micro-fragments shorter than `bubbles.min_bubble_chars`.

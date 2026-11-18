@@ -285,8 +285,22 @@ def test_plan_outgoing_bubbles_shapes_dedups_and_collapses() -> None:
         policy=policy,
         interrupted=True,
     )
-    assert len(collapsed) == 1
-    assert "第一段内容比较长 / 第二段内容比较长 / 第三段内容比较长" == collapsed[0]
+    assert collapsed == ["第一段内容比较长"]
+
+    collapsed_short = plan_outgoing_bubbles(
+        ["嗯", "第二段内容比较长", "第三段内容比较长"],
+        policy=policy,
+        interrupted=True,
+    )
+    assert collapsed_short == ["嗯 / 第二段内容比较长"]
+
+    policy_join = policy.with_overrides({"interrupt_keep_first_only": False})
+    collapsed_join = plan_outgoing_bubbles(
+        ["第一段内容比较长", "第二段内容比较长", "第三段内容比较长"],
+        policy=policy_join,
+        interrupted=True,
+    )
+    assert collapsed_join == ["第一段内容比较长 / 第二段内容比较长 / 第三段内容比较长"]
 
 
 def test_extension_api_discovery_resolvers_filters_and_isolation() -> None:
@@ -445,7 +459,7 @@ def test_plugin_hooks_end_to_end_coalesce_collapse_and_empty_release() -> None:
             await plugin.shape_outgoing_bubbles(e1)
             plain_parts = [c for c in res1.chain if isinstance(c, Plain)]
             assert len(plain_parts) == 1
-            assert "我在看啦 刚才卡了一下 现在看看你发的图" == plain_parts[0].text
+            assert "我在看啦" == plain_parts[0].text
             assert isinstance(res1.chain[0], Reply)
 
             # Finish sending Turn 1 -> unblocks e2 with merged e2+e3.
@@ -603,6 +617,227 @@ def test_non_wake_group_chat_and_early_result_release_never_stall() -> None:
             evt_img.set_result(img_res)
             await plugin.shape_outgoing_bubbles(evt_img)
             assert plugin.extension_api.get_session_state(priv_umo)["in_flight"] is False
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())
+
+
+def test_followup_after_interrupt_narrows_to_single_bubble() -> None:
+    async def _run() -> None:
+        plugin = BubbleFlowPlugin(
+            _FakeContext([]),
+            {
+                "enabled": True,
+                "channels": {"enable_private": True, "enable_group": False},
+                "coalesce": {"trailing_quiet_seconds": 0.0, "trailing_max_wait_seconds": 0.0},
+                "bubbles": {"max_bubbles": 2, "collapse_on_interrupt": True, "bubble_sep": " "},
+            },
+        )
+        umo = "elle:FriendMessage:577866846"
+        try:
+            e1 = _FakeEvent(umo, "我确实有玩")
+            await plugin.handle_interleave_intake(e1)
+            await plugin.inject_coalesce_context(e1, ProviderRequest(prompt="我确实有玩"))
+
+            e2 = _FakeEvent(umo, "但玩的不多")
+            task2 = asyncio.create_task(plugin.handle_interleave_intake(e2))
+            await asyncio.sleep(0.02)
+
+            res1 = MessageEventResult().message("难怪一眼就认出来了\n那你平时基建搞得咋样？")
+            res1.result_content_type = ResultContentType.LLM_RESULT
+            e1.set_result(res1)
+            await plugin.shape_outgoing_bubbles(e1)
+            assert [c.text for c in res1.chain if isinstance(c, Plain)] == ["难怪一眼就认出来了"]
+            await plugin.on_after_message_sent(e1)
+
+            await task2
+            req2 = ProviderRequest(prompt="但玩的不多", contexts=[], extra_user_content_parts=[])
+            await plugin.inject_coalesce_context(e2, req2)
+            res2 = MessageEventResult().message("慢慢玩也挺好的\n平时摸鱼推剧情就够了")
+            res2.result_content_type = ResultContentType.LLM_RESULT
+            e2.set_result(res2)
+            await plugin.shape_outgoing_bubbles(e2)
+            assert [c.text for c in res2.chain if isinstance(c, Plain)] == [
+                "慢慢玩也挺好的 平时摸鱼推剧情就够了"
+            ]
+            await plugin.on_after_message_sent(e2)
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())
+
+
+def test_clean_plain_bubble_text_multi_sender_preview_expiry_and_eviction(tmp_path: Path) -> None:
+    from astrbot_plugin_bubble_flow.coordinator import (
+        BurstBatch,
+        CapturedMessage,
+        clean_plain_bubble_text,
+    )
+
+    # 1. Markdown + period + URL preservation
+    raw = "**重点**：先看 https://example.com/a.html 。然后继续。"
+    cleaned = clean_plain_bubble_text(
+        raw,
+        strip_markdown=True,
+        strip_trailing_period=True,
+        split_on_cn_period=True,
+    )
+    assert "**" not in cleaned
+    assert "https://example.com/a.html" in cleaned
+    assert cleaned == "重点：先看 https://example.com/a.html\n然后继续"
+
+    # 2. Multi-sender attribution in merged_text
+    batch_multi = BurstBatch(
+        items=(
+            CapturedMessage(text="第一句", received_at=1.0, sender_id="1001"),
+            CapturedMessage(text="第二句", received_at=1.5, sender_id="1002"),
+        )
+    )
+    assert batch_multi.merged_text == "1. [1001] 第一句\n2. [1002] 第二句"
+
+    batch_single = BurstBatch(
+        items=(
+            CapturedMessage(text="第一句", received_at=1.0, sender_id="1001"),
+            CapturedMessage(text="第二句", received_at=1.5, sender_id="1001"),
+        )
+    )
+    assert batch_single.merged_text == "1. 第一句\n2. 第二句"
+
+    # 3. Stale last_reply_preview must not leak across non-text/idle turns + lazy eviction
+    async def _run() -> None:
+        clk = _FakeClock(1000.0)
+        coord = SessionFlightCoordinator(clock=clk)
+        pol = BubblePolicy(
+            enabled=True,
+            trailing_quiet_seconds=0.0,
+            trailing_max_wait_seconds=0.0,
+            max_flight_seconds=30.0,
+        )
+        umo = "elle:FriendMessage:577866846"
+        try:
+            # Turn 1 records a reply preview
+            a1 = await coord.admit_or_coalesce(umo, CapturedMessage("hi", clk()), policy=pol)
+            await coord.record_reply_preview(umo, a1.token, "旧回复内容")
+            await coord.release_flight(umo, a1.token)
+
+            # Later Turn 2 (image-only, never calls record_reply_preview) interrupted by Turn 3
+            clk.advance(500.0)
+            a2 = await coord.admit_or_coalesce(umo, CapturedMessage("发图", clk()), policy=pol)
+            t3 = asyncio.create_task(
+                coord.wait_and_collect_flush(
+                    umo,
+                    (await coord.admit_or_coalesce(umo, CapturedMessage("补充", clk()), policy=pol)).token,
+                    policy=pol,
+                )
+            )
+            await asyncio.sleep(0.01)
+            await coord.release_flight(umo, a2.token)
+            _, batch3 = await t3
+            assert batch3 is not None
+            assert batch3.last_reply_preview == ""
+
+            # Lazy eviction of >128 stale idle flights after 24h
+            for i in range(135):
+                u = f"elle:FriendMessage:stale_{i}"
+                adm = await coord.admit_or_coalesce(u, CapturedMessage("ping", clk()), policy=pol)
+                await coord.release_flight(u, adm.token)
+            assert len(coord._flights) >= 135
+            clk.advance(90000.0)
+            adm_new = await coord.admit_or_coalesce("elle:FriendMessage:fresh", CapturedMessage("new", clk()), policy=pol)
+            await coord.release_flight("elle:FriendMessage:fresh", adm_new.token)
+            assert len(coord._flights) < 10
+
+            # Normalized local path dedup in inject_coalesce_context
+            pic = tmp_path / "pic.png"
+            pic.write_bytes(b"img")
+            plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
+            try:
+                ev = _FakeEvent(umo, "看图", components=[Plain("看图"), Image.fromFileSystem(str(pic))])
+                await plugin.handle_interleave_intake(ev)
+                ev2 = _FakeEvent(umo, "还有", components=[Plain("还有"), Image.fromFileSystem(str(tmp_path / "." / "pic.png"))])
+                t_wait = asyncio.create_task(plugin.handle_interleave_intake(ev2))
+                await asyncio.sleep(0.01)
+                await plugin._release_turn_slot(umo, ev.get_extra("_bubble_flow_token", ""))
+                await t_wait
+                req = ProviderRequest(prompt="还有", image_urls=[str(pic.resolve())], contexts=[], extra_user_content_parts=[])
+                await plugin.inject_coalesce_context(ev2, req)
+                assert len(req.image_urls) == 1
+            finally:
+                await plugin.terminate()
+        finally:
+            await coord.close()
+
+    asyncio.run(_run())
+
+
+def test_settling_window_race_cancellation_cleanup_and_streaming_release() -> None:
+    async def _run() -> None:
+        # 1. Trailing settling window must absorb m3 into m2 instead of concurrent run_now
+        clk = _FakeClock(2000.0)
+        coord = SessionFlightCoordinator(clock=clk)
+        pol = BubblePolicy(
+            enabled=True,
+            trailing_quiet_seconds=0.05,
+            trailing_max_wait_seconds=0.2,
+            max_flight_seconds=30.0,
+        )
+        umo = "elle:FriendMessage:577866846"
+        try:
+            a1 = await coord.admit_or_coalesce(umo, CapturedMessage("m1", clk()), policy=pol)
+            assert a1.mode == "run_now"
+            a2 = await coord.admit_or_coalesce(umo, CapturedMessage("m2", clk()), policy=pol)
+            assert a2.mode == "wait_flush"
+            waiter_task = asyncio.create_task(coord.wait_and_collect_flush(umo, a2.token, policy=pol))
+            await asyncio.sleep(0.01)
+
+            # Release m1 -> enters settling=True while waiter sleeps in trailing window
+            assert await coord.release_flight(umo, a1.token) is True
+            await asyncio.sleep(0.01)
+            a3 = await coord.admit_or_coalesce(umo, CapturedMessage("m3", clk()), policy=pol)
+            assert a3.mode == "swallowed"
+
+            tok2, batch2 = await waiter_task
+            assert tok2 != ""
+            assert batch2 is not None and batch2.count == 2
+            assert batch2.merged_text == "1. m2\n2. m3"
+            assert coord.snapshot(umo)["total_runs"] == 2
+            assert await coord.release_flight(umo, tok2) is True
+            assert coord.snapshot(umo)["in_flight"] is False
+
+            # 2. Cancelled waiter cleans up waiter_token & settling so subsequent messages never swallow forever
+            b1 = await coord.admit_or_coalesce(umo, CapturedMessage("x1", clk()), policy=pol)
+            b2 = await coord.admit_or_coalesce(umo, CapturedMessage("x2", clk()), policy=pol)
+            cancel_task = asyncio.create_task(coord.wait_and_collect_flush(umo, b2.token, policy=pol))
+            await asyncio.sleep(0.01)
+            cancel_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await cancel_task
+            assert await coord.release_flight(umo, b1.token) is True
+            b3 = await coord.admit_or_coalesce(umo, CapturedMessage("x3", clk()), policy=pol)
+            assert b3.mode == "run_now"
+            assert await coord.release_flight(umo, b3.token) is True
+        finally:
+            await coord.close()
+
+        # 3. Streaming responses keep lock on STREAMING_RESULT and release on STREAMING_FINISH
+        plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
+        try:
+            ev = _FakeEvent(umo, "流式测试")
+            await plugin.handle_interleave_intake(ev)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
+
+            res_stream = MessageEventResult()
+            res_stream.result_content_type = ResultContentType.STREAMING_RESULT
+            ev.set_result(res_stream)
+            await plugin.shape_outgoing_bubbles(ev)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
+
+            res_done = MessageEventResult()
+            res_done.result_content_type = ResultContentType.STREAMING_FINISH
+            ev.set_result(res_done)
+            await plugin.shape_outgoing_bubbles(ev)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
         finally:
             await plugin.terminate()
 

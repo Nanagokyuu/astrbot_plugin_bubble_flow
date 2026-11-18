@@ -74,6 +74,12 @@
         "type": "bool",
         "default": true
       },
+      "interrupt_keep_first_only": {
+        "description": "被打断时仅保留首条反应气泡",
+        "hint": "开启后，生成期间被打断的回复只保留第 1 个完整气泡并丢弃后续展开句，避免先发长段又紧接着追补第二轮。",
+        "type": "bool",
+        "default": true
+      },
       "min_bubble_chars": {
         "description": "最小气泡长度阈值（字）",
         "hint": "短于该长度的零碎短行（如“嗯”“好”）自动贴合到相邻气泡，避免无意义的碎片连发。",
@@ -90,6 +96,24 @@
         "hint": "多个短句合进同一个气泡时中间使用的分隔符（默认换行，支持配合 AstrBot 分段规则）。",
         "type": "string",
         "default": "\n"
+      },
+      "strip_markdown": {
+        "description": "剥除常见 Markdown 排版符号（**粗体**/`代码`/标题/列表）",
+        "hint": "适合 QQ 等不支持 Markdown 渲染的纯文本聊天平台，让回复更像真人敲字。",
+        "type": "bool",
+        "default": false
+      },
+      "strip_trailing_period": {
+        "description": "去掉气泡末尾的中文句号「。」",
+        "hint": "保留省略号和 URL，仅去掉句尾僵硬的句号。",
+        "type": "bool",
+        "default": false
+      },
+      "split_on_cn_period": {
+        "description": "按中文句号「。」自动拆分为多气泡",
+        "hint": "开启后即使模型未主动换行，也会在安全位置按句号拆泡（自动保护 URL 不被拆断）。",
+        "type": "bool",
+        "default": false
       }
     }
   },

@@ -8,9 +8,19 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import re
 import time
 from typing import Any, Callable
 from uuid import uuid4
+
+_RE_URL = re.compile(r"https?://[^\s\n]+")
+_RE_MD_BOLD_ASTERISK = re.compile(r"\*\*(.+?)\*\*")
+_RE_MD_BOLD_UNDER = re.compile(r"__(.+?)__")
+_RE_MD_INLINE_CODE = re.compile(r"`([^`\n]+)`")
+_RE_MD_HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
+_RE_MD_BULLET = re.compile(r"(?m)^[ \t]*[-*+][ \t]+")
+_RE_INTERNAL_CN_PERIOD = re.compile(r"[ \t]*。+[ \t]*(?=[^\s\n”」』’)）\"'])")
+_RE_TRAILING_CN_PERIOD = re.compile(r"。+(?=\s*(?:\n|$))")
 
 
 @dataclass(frozen=True)
@@ -27,9 +37,13 @@ class BubblePolicy:
     coalesce_images: bool = True
     max_bubbles: int = 2
     collapse_on_interrupt: bool = True
+    interrupt_keep_first_only: bool = True
     min_bubble_chars: int = 4
     dedup_identical_bubbles: bool = True
     bubble_sep: str = "\n"
+    strip_markdown: bool = False
+    strip_trailing_period: bool = False
+    split_on_cn_period: bool = False
     inject_coalesce_hint: bool = True
 
     @classmethod
@@ -53,9 +67,13 @@ class BubblePolicy:
             coalesce_images=bool(coalesce.get("coalesce_images", raw.get("coalesce_images", True))),
             max_bubbles=max(1, int(bubbles.get("max_bubbles", raw.get("max_bubbles", 2)))),
             collapse_on_interrupt=bool(bubbles.get("collapse_on_interrupt", raw.get("collapse_on_interrupt", True))),
+            interrupt_keep_first_only=bool(bubbles.get("interrupt_keep_first_only", raw.get("interrupt_keep_first_only", True))),
             min_bubble_chars=max(0, int(bubbles.get("min_bubble_chars", raw.get("min_bubble_chars", 4)))),
             dedup_identical_bubbles=bool(bubbles.get("dedup_identical_bubbles", raw.get("dedup_identical_bubbles", True))),
             bubble_sep=str(bubbles.get("bubble_sep", raw.get("bubble_sep", "\n")) or "\n"),
+            strip_markdown=bool(bubbles.get("strip_markdown", raw.get("strip_markdown", False))),
+            strip_trailing_period=bool(bubbles.get("strip_trailing_period", raw.get("strip_trailing_period", False))),
+            split_on_cn_period=bool(bubbles.get("split_on_cn_period", raw.get("split_on_cn_period", False))),
             inject_coalesce_hint=bool(prompts.get("inject_coalesce_hint", raw.get("inject_coalesce_hint", True))),
         )
 
@@ -98,6 +116,8 @@ class BurstBatch:
 
     @property
     def merged_text(self) -> str:
+        distinct_senders = {item.sender_id for item in self.items if item.sender_id}
+        multi_sender = self.count > 1 and len(distinct_senders) > 1
         lines: list[str] = []
         for idx, item in enumerate(self.items, start=1):
             parts: list[str] = []
@@ -109,7 +129,12 @@ class BurstBatch:
                 parts.append("[图片]")
             line = " ".join(parts).strip()
             if line:
-                lines.append(line if self.count == 1 else f"{idx}. {line}")
+                if self.count == 1:
+                    lines.append(line)
+                elif multi_sender and item.sender_id:
+                    lines.append(f"{idx}. [{item.sender_id}] {line}")
+                else:
+                    lines.append(f"{idx}. {line}")
         return "\n".join(lines)
 
     @property
@@ -140,10 +165,13 @@ class AdmissionResult:
 class _SessionFlight:
     umo: str
     in_flight: bool = False
+    settling: bool = False
     flight_token: str = ""
     started_at: float = 0.0
     llm_started: bool = False
     last_reply_preview: str = ""
+    last_reply_at: float = 0.0
+    last_activity_at: float = 0.0
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     waiter_token: str = ""
@@ -195,6 +223,11 @@ def plan_outgoing_bubbles(
         cleaned = deduped
 
     if interrupted and policy.collapse_on_interrupt:
+        if policy.interrupt_keep_first_only and len(cleaned) > 1:
+            first = cleaned[0]
+            if policy.min_bubble_chars > 0 and len(first) < policy.min_bubble_chars:
+                return [f"{first}{policy.bubble_sep}{cleaned[1]}"]
+            return [first]
         return [policy.bubble_sep.join(cleaned)]
 
     # Merge tiny micro-fragments (< min_bubble_chars) into an adjacent bubble
@@ -226,6 +259,38 @@ def plan_outgoing_bubbles(
     return cleaned
 
 
+def clean_plain_bubble_text(
+    text: str,
+    *,
+    strip_markdown: bool = False,
+    strip_trailing_period: bool = False,
+    split_on_cn_period: bool = False,
+) -> str:
+    """Optionally normalize markdown, trailing Chinese periods, and internal period splits while masking URLs."""
+    if not text or not (strip_markdown or strip_trailing_period or split_on_cn_period):
+        return text
+    urls: list[str] = []
+
+    def _mask_url(match: re.Match[str]) -> str:
+        urls.append(match.group(0))
+        return f"\x00URL{len(urls) - 1}\x00"
+
+    cleaned = _RE_URL.sub(_mask_url, text)
+    if strip_markdown:
+        cleaned = _RE_MD_HEADING.sub("", cleaned)
+        cleaned = _RE_MD_BULLET.sub("", cleaned)
+        cleaned = _RE_MD_BOLD_ASTERISK.sub(r"\1", cleaned)
+        cleaned = _RE_MD_BOLD_UNDER.sub(r"\1", cleaned)
+        cleaned = _RE_MD_INLINE_CODE.sub(r"\1", cleaned)
+    if split_on_cn_period:
+        cleaned = _RE_INTERNAL_CN_PERIOD.sub("\n", cleaned)
+    if strip_trailing_period:
+        cleaned = _RE_TRAILING_CN_PERIOD.sub("", cleaned)
+    for idx, url in enumerate(urls):
+        cleaned = cleaned.replace(f"\x00URL{idx}\x00", url)
+    return cleaned
+
+
 class SessionFlightCoordinator:
     """Async per-session flight coordinator eliminating serial follow-up avalanches."""
 
@@ -238,7 +303,22 @@ class SessionFlightCoordinator:
     def _get(self, umo: str) -> _SessionFlight:
         flight = self._flights.get(umo)
         if flight is None:
-            flight = _SessionFlight(umo=umo)
+            if len(self._flights) > 128:
+                now = self._clock()
+                stale = [
+                    k
+                    for k, v in self._flights.items()
+                    if not v.in_flight
+                    and not v.settling
+                    and not v.idle_active
+                    and not v.waiter_token
+                    and not v.burst_items
+                    and v.last_activity_at > 0
+                    and (now - v.last_activity_at) > 86400.0
+                ]
+                for k in stale:
+                    self._flights.pop(k, None)
+            flight = _SessionFlight(umo=umo, last_activity_at=self._clock())
             self._flights[umo] = flight
         return flight
 
@@ -249,6 +329,8 @@ class SessionFlightCoordinator:
             flight.in_flight = False
             flight.flight_token = ""
             flight.llm_started = False
+            if flight.waiter_token:
+                flight.settling = True
             flight.total_watchdog_resets += 1
             flight.done_event.set()
             return True
@@ -267,10 +349,11 @@ class SessionFlightCoordinator:
 
         async with self._lock:
             flight = self._get(umo)
+            flight.last_activity_at = self._clock()
             self._check_watchdog_locked(flight, policy.max_flight_seconds)
 
-            # Case 1: Session currently has an in-flight LLM/send turn
-            if flight.in_flight:
+            # Case 1: Session currently has an in-flight LLM/send turn (or is settling trailing bursts)
+            if flight.in_flight or flight.settling:
                 flight.burst_items.append(message)
                 flight.total_coalesced += 1
                 flight.burst_updated.set()
@@ -300,6 +383,8 @@ class SessionFlightCoordinator:
             flight.flight_token = token
             flight.started_at = self._clock()
             flight.llm_started = False
+            flight.last_reply_preview = ""
+            flight.last_reply_at = 0.0
             flight.done_event.clear()
             flight.total_runs += 1
             return AdmissionResult(mode="run_now", token=token)
@@ -312,48 +397,60 @@ class SessionFlightCoordinator:
         policy: BubblePolicy,
     ) -> tuple[str, BurstBatch | None]:
         """Wait for standalone idle debounce window and promote collected messages to in-flight."""
-        async with self._lock:
-            flight = self._get(umo)
-            if not flight.idle_active or flight.idle_leader_token != leader_token:
-                return ("", None)
-            first_at = flight.idle_items[0].received_at if flight.idle_items else self._clock()
-
-        max_end = self._clock() + min(policy.idle_debounce_seconds * 2.5, max(policy.idle_debounce_seconds, 0.2) + 2.0)
-        while not self._closed:
+        try:
             async with self._lock:
                 flight = self._get(umo)
                 if not flight.idle_active or flight.idle_leader_token != leader_token:
                     return ("", None)
-                last_at = flight.idle_items[-1].received_at if flight.idle_items else first_at
-                quiet_target = last_at + policy.idle_debounce_seconds
-                now = self._clock()
-                remaining = min(quiet_target, max_end) - now
-                if remaining <= 0:
+                first_at = flight.idle_items[0].received_at if flight.idle_items else self._clock()
+
+            max_end = self._clock() + min(policy.idle_debounce_seconds * 2.5, max(policy.idle_debounce_seconds, 0.2) + 2.0)
+            while not self._closed:
+                async with self._lock:
+                    flight = self._get(umo)
+                    if not flight.idle_active or flight.idle_leader_token != leader_token:
+                        return ("", None)
+                    last_at = flight.idle_items[-1].received_at if flight.idle_items else first_at
+                    quiet_target = last_at + policy.idle_debounce_seconds
+                    now = self._clock()
+                    remaining = min(quiet_target, max_end) - now
+                    if remaining <= 0:
+                        break
+                    flight.idle_updated.clear()
+                try:
+                    await asyncio.wait_for(flight.idle_updated.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
                     break
-                flight.idle_updated.clear()
-            try:
-                await asyncio.wait_for(flight.idle_updated.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
 
-        async with self._lock:
-            flight = self._get(umo)
-            if self._closed or not flight.idle_active or flight.idle_leader_token != leader_token:
-                return ("", None)
-            items = tuple(flight.idle_items)
-            flight.idle_active = False
-            flight.idle_leader_token = ""
-            flight.idle_items = []
+            async with self._lock:
+                flight = self._get(umo)
+                if self._closed or not flight.idle_active or flight.idle_leader_token != leader_token:
+                    return ("", None)
+                if flight.in_flight or flight.settling:
+                    return ("", None)
+                items = tuple(flight.idle_items)
+                flight.idle_active = False
+                flight.idle_leader_token = ""
+                flight.idle_items = []
 
-            token = uuid4().hex
-            flight.in_flight = True
-            flight.flight_token = token
-            flight.started_at = self._clock()
-            flight.llm_started = False
-            flight.done_event.clear()
-            flight.total_runs += 1
-            batch = BurstBatch(items=items, last_reply_preview=flight.last_reply_preview, flushed_at=self._clock()) if len(items) > 1 else None
-            return (token, batch)
+                token = uuid4().hex
+                flight.in_flight = True
+                flight.flight_token = token
+                flight.started_at = self._clock()
+                flight.llm_started = False
+                flight.last_reply_preview = ""
+                flight.last_reply_at = 0.0
+                flight.done_event.clear()
+                flight.total_runs += 1
+                batch = BurstBatch(items=items, last_reply_preview="", flushed_at=self._clock()) if len(items) > 1 else None
+                return (token, batch)
+        except BaseException:
+            flight = self._flights.get(umo)
+            if flight is not None and flight.idle_leader_token == leader_token:
+                flight.idle_active = False
+                flight.idle_leader_token = ""
+                flight.idle_items = []
+            raise
 
     async def wait_and_collect_flush(
         self,
@@ -363,66 +460,95 @@ class SessionFlightCoordinator:
         policy: BubblePolicy,
     ) -> tuple[str, BurstBatch | None]:
         """Wait for the in-flight turn to finish, absorb tail messages, and promote batch to flight."""
-        while not self._closed:
+        try:
+            while not self._closed:
+                async with self._lock:
+                    flight = self._get(umo)
+                    if flight.waiter_token != waiter_token:
+                        return ("", None)
+                    self._check_watchdog_locked(flight, policy.max_flight_seconds)
+                    if not flight.in_flight:
+                        break
+                    wait_timeout = max(0.05, policy.max_flight_seconds - (self._clock() - flight.started_at))
+                try:
+                    await asyncio.wait_for(flight.done_event.wait(), timeout=wait_timeout)
+                except asyncio.TimeoutError:
+                    continue
+
+            if self._closed:
+                flight = self._flights.get(umo)
+                if flight is not None and flight.waiter_token == waiter_token:
+                    flight.waiter_token = ""
+                    flight.settling = False
+                    flight.burst_items = []
+                return ("", None)
+
+            # Brief tail settling window after the prior reply finished
+            max_tail_end = self._clock() + max(0.0, policy.trailing_max_wait_seconds)
+            while policy.trailing_quiet_seconds > 0 and not self._closed:
+                async with self._lock:
+                    flight = self._get(umo)
+                    if flight.waiter_token != waiter_token:
+                        return ("", None)
+                    if not flight.burst_items:
+                        break
+                    now = self._clock()
+                    last_at = max(item.received_at for item in flight.burst_items)
+                    remaining = min(last_at + policy.trailing_quiet_seconds, max_tail_end) - now
+                    if remaining <= 0:
+                        break
+                    flight.burst_updated.clear()
+                try:
+                    await asyncio.wait_for(flight.burst_updated.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+
             async with self._lock:
                 flight = self._get(umo)
-                if flight.waiter_token != waiter_token:
+                if self._closed or flight.waiter_token != waiter_token:
+                    if flight.waiter_token == waiter_token:
+                        flight.waiter_token = ""
+                        flight.settling = False
+                        flight.burst_items = []
                     return ("", None)
-                self._check_watchdog_locked(flight, policy.max_flight_seconds)
-                if not flight.in_flight:
-                    break
-                wait_timeout = max(0.05, policy.max_flight_seconds - (self._clock() - flight.started_at))
-            try:
-                await asyncio.wait_for(flight.done_event.wait(), timeout=wait_timeout)
-            except asyncio.TimeoutError:
-                continue
-
-        if self._closed:
-            return ("", None)
-
-        # Brief tail settling window after the prior reply finished
-        max_tail_end = self._clock() + max(0.0, policy.trailing_max_wait_seconds)
-        while policy.trailing_quiet_seconds > 0 and not self._closed:
-            async with self._lock:
-                flight = self._get(umo)
-                if flight.waiter_token != waiter_token:
+                items = tuple(flight.burst_items)
+                flight.burst_items = []
+                flight.waiter_token = ""
+                flight.settling = False
+                if not items or flight.in_flight:
                     return ("", None)
-                if not flight.burst_items:
-                    break
+
                 now = self._clock()
-                last_at = max(item.received_at for item in flight.burst_items)
-                remaining = min(last_at + policy.trailing_quiet_seconds, max_tail_end) - now
-                if remaining <= 0:
-                    break
-                flight.burst_updated.clear()
-            try:
-                await asyncio.wait_for(flight.burst_updated.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
-                break
+                preview = ""
+                if (
+                    flight.last_reply_preview
+                    and flight.last_reply_at > 0
+                    and (now - flight.last_reply_at) <= max(60.0, policy.max_flight_seconds)
+                ):
+                    preview = flight.last_reply_preview
+                flight.last_reply_preview = ""
+                flight.last_reply_at = 0.0
 
-        async with self._lock:
-            flight = self._get(umo)
-            if self._closed or flight.waiter_token != waiter_token:
-                return ("", None)
-            items = tuple(flight.burst_items)
-            flight.burst_items = []
-            flight.waiter_token = ""
-            if not items:
-                return ("", None)
-
-            new_token = uuid4().hex
-            flight.in_flight = True
-            flight.flight_token = new_token
-            flight.started_at = self._clock()
-            flight.llm_started = False
-            flight.done_event.clear()
-            flight.total_runs += 1
-            batch = BurstBatch(
-                items=items,
-                last_reply_preview=flight.last_reply_preview,
-                flushed_at=self._clock(),
-            )
-            return (new_token, batch)
+                new_token = uuid4().hex
+                flight.in_flight = True
+                flight.flight_token = new_token
+                flight.started_at = now
+                flight.llm_started = False
+                flight.done_event.clear()
+                flight.total_runs += 1
+                batch = BurstBatch(
+                    items=items,
+                    last_reply_preview=preview,
+                    flushed_at=now,
+                )
+                return (new_token, batch)
+        except BaseException:
+            flight = self._flights.get(umo)
+            if flight is not None and flight.waiter_token == waiter_token:
+                flight.waiter_token = ""
+                flight.settling = False
+                flight.burst_items = []
+            raise
 
     async def mark_llm_started(self, umo: str, token: str) -> None:
         async with self._lock:
@@ -437,6 +563,7 @@ class SessionFlightCoordinator:
                 clean = str(text or "").strip()
                 if clean:
                     flight.last_reply_preview = clean[:120]
+                    flight.last_reply_at = self._clock()
                 if collapsed:
                     flight.total_collapsed += 1
 
@@ -451,6 +578,8 @@ class SessionFlightCoordinator:
             flight.in_flight = False
             flight.flight_token = ""
             flight.llm_started = False
+            if flight.waiter_token:
+                flight.settling = True
             flight.done_event.set()
             return True
 
