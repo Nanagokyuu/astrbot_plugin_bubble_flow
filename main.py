@@ -34,7 +34,6 @@ from .coordinator import (
     default_coalesce_prompt,
     plan_outgoing_bubbles,
 )
-from .watchdog import FlightWatchdog
 
 
 class BubbleFlowPlugin(Star):
@@ -43,12 +42,13 @@ class BubbleFlowPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None) -> None:
         super().__init__(context, config)
         self.config: dict[str, Any] = dict(config or {})
-        self.coordinator = SessionFlightCoordinator()
+        self.coordinator = SessionFlightCoordinator(
+            on_flight_expired=self._on_flight_expired
+        )
         self.extension_api = BubbleFlowAPI(
             self.coordinator,
             lambda: BubblePolicy.from_mapping(self.config),
         )
-        self._watchdog = FlightWatchdog(self._on_watchdog_expired)
 
     # ------------------------------------------------------------------ #
     # Turn lifecycle plumbing
@@ -84,11 +84,10 @@ class BubbleFlowPlugin(Star):
             return policy.enable_group
         return policy.enable_private or policy.enable_group
 
-    async def _on_watchdog_expired(
+    async def _on_flight_expired(
         self, umo: str, token: str, timeout_seconds: float
     ) -> None:
-        if not await self.coordinator.release_flight(umo, token):
-            return
+        # The coordinator already released the flight; this is the observable side.
         logger.warning(
             "[BubbleFlow] Watchdog released stalled flight for umo=%s token=%s after %.1fs",
             umo,
@@ -110,7 +109,6 @@ class BubbleFlowPlugin(Star):
         # intake) must never cancel another turn's flight lock.
         if not umo or not token:
             return
-        self._watchdog.cancel(umo, token)
         if await self.coordinator.release_flight(umo, token):
             await self._emit("turn.finished", umo=umo, token=token, empty_result=empty_result)
 
@@ -218,7 +216,6 @@ class BubbleFlowPlugin(Star):
         if batch is not None and batch.count > 0:
             await self._publish_batch(event, umo, token, batch, policy)
 
-        self._watchdog.start(umo, token, policy.max_flight_seconds)
         await self._emit(
             "turn.started",
             umo=umo,
@@ -437,6 +434,5 @@ class BubbleFlowPlugin(Star):
 
     async def terminate(self) -> None:
         """Cancel background watchdogs and release coordinator resources."""
-        self._watchdog.close()
         await self.coordinator.close()
         self.extension_api.clear_registrations()

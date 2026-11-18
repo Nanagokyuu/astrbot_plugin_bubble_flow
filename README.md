@@ -23,6 +23,17 @@ When a user sends several consecutive messages (text, images, or reply quotes) w
 - **Reserved Extension API (`bubble-flow.v1`)**:
   - Allows downstream plugins to dynamically tune per-session policies, format coalesce prompts, post-process outgoing bubbles, bypass intake for special triggers, and observe lifecycle events with full callback exception isolation.
 
+## Architecture
+
+| Module | Responsibility |
+| --- | --- |
+| `main.py` | Wires the four AstrBot hooks; contains no host reflection. |
+| `compat.py` | The only place touching AstrBot event/result/component APIs; tolerant of version and platform differences. |
+| `coordinator.py` | Pure `asyncio` per-session state machine, bubble planner, and the flight watchdog. |
+| `api.py` | Versioned `bubble-flow.v1` extension API. |
+
+**Watchdog semantics**: `max_flight_seconds` is captured when a turn is admitted and stays fixed for that turn. A later policy change (for example a `policy_resolver` returning a shorter timeout for the next message) can never shorten or release a turn that is already running. The turn's own timer is the single authority on watchdog expiry, it is cancelled as soon as the turn releases its flight lock, and expiry is reported once per turn through the `turn.watchdog_released` event.
+
 ## Configuration (`_conf_schema.json`)
 
 | Group | Key | Type | Default | Description |

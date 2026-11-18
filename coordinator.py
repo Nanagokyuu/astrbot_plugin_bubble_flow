@@ -7,10 +7,11 @@ be tested standalone and reused across any AstrBot plugin setup.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
 import re
 import time
-from typing import Any, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
 _RE_URL = re.compile(r"https?://[^\s\n。，！？；：、）】》」』\"'<>]+")
@@ -182,6 +183,7 @@ class _SessionFlight:
     idle_items: list[CapturedMessage] = field(default_factory=list)
     idle_updated: asyncio.Event = field(default_factory=asyncio.Event)
     idle_active: bool = False
+    watchdog_task: asyncio.Task[Any] | None = None
 
     total_runs: int = 0
     total_coalesced: int = 0
@@ -294,8 +296,14 @@ def clean_plain_bubble_text(
 class SessionFlightCoordinator:
     """Async per-session flight coordinator eliminating serial follow-up avalanches."""
 
-    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        on_flight_expired: Callable[[str, str, float], Awaitable[None]] | None = None,
+    ) -> None:
         self._clock = clock
+        self._on_flight_expired = on_flight_expired
         self._lock = asyncio.Lock()
         self._flights: dict[str, _SessionFlight] = {}
         self._closed = False
@@ -326,19 +334,77 @@ class SessionFlightCoordinator:
             self._flights[umo] = flight
         return flight
 
-    def _check_watchdog_locked(self, flight: _SessionFlight, max_flight_seconds: float) -> bool:
-        if not flight.in_flight or max_flight_seconds <= 0:
-            return False
-        if (self._clock() - flight.started_at) >= max_flight_seconds:
-            flight.in_flight = False
-            flight.flight_token = ""
-            flight.llm_started = False
-            if flight.waiter_token:
-                flight.settling = True
-            flight.total_watchdog_resets += 1
-            flight.done_event.set()
-            return True
-        return False
+    def _release_locked(self, flight: _SessionFlight) -> None:
+        """Drop the flight lock, stop its watchdog timer, and wake waiters."""
+        task = flight.watchdog_task
+        flight.watchdog_task = None
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+        flight.in_flight = False
+        flight.flight_token = ""
+        flight.llm_started = False
+        if flight.waiter_token:
+            flight.settling = True
+        flight.done_event.set()
+
+    def _arm_watchdog_locked(
+        self, flight: _SessionFlight, timeout_seconds: float
+    ) -> None:
+        """Start the single timer that owns this turn's watchdog deadline."""
+        if flight.watchdog_task is not None and not flight.watchdog_task.done():
+            flight.watchdog_task.cancel()
+        flight.watchdog_task = None
+        if not flight.in_flight or timeout_seconds <= 0:
+            return
+        flight.watchdog_task = asyncio.create_task(
+            self._run_watchdog(flight.umo, flight.flight_token, timeout_seconds)
+        )
+
+    async def _run_watchdog(
+        self, umo: str, token: str, timeout_seconds: float
+    ) -> None:
+        try:
+            await asyncio.sleep(timeout_seconds)
+        except asyncio.CancelledError:
+            return
+        expired = False
+        async with self._lock:
+            flight = self._flights.get(umo)
+            if flight is not None and flight.in_flight and flight.flight_token == token:
+                self._release_locked(flight)
+                flight.total_watchdog_resets += 1
+                expired = True
+        if expired and self._on_flight_expired is not None:
+            try:
+                await self._on_flight_expired(umo, token, timeout_seconds)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _drop_waiter_locked(flight: _SessionFlight, waiter_token: str) -> None:
+        if flight.waiter_token == waiter_token:
+            flight.waiter_token = ""
+            flight.settling = False
+            flight.burst_items = []
+
+    @staticmethod
+    def _drop_idle_locked(flight: _SessionFlight, leader_token: str) -> None:
+        if flight.idle_leader_token == leader_token:
+            flight.idle_active = False
+            flight.idle_leader_token = ""
+            flight.idle_items = []
+
+    async def _drop_waiter(self, umo: str, waiter_token: str) -> None:
+        async with self._lock:
+            flight = self._flights.get(umo)
+            if flight is not None:
+                self._drop_waiter_locked(flight, waiter_token)
+
+    async def _drop_idle_leader(self, umo: str, leader_token: str) -> None:
+        async with self._lock:
+            flight = self._flights.get(umo)
+            if flight is not None:
+                self._drop_idle_locked(flight, leader_token)
 
     async def admit_or_coalesce(
         self,
@@ -354,7 +420,6 @@ class SessionFlightCoordinator:
         async with self._lock:
             flight = self._get(umo)
             flight.last_activity_at = self._clock()
-            self._check_watchdog_locked(flight, policy.max_flight_seconds)
 
             # Case 1: Session currently has an in-flight LLM/send turn (or is settling trailing bursts)
             if flight.in_flight or flight.settling:
@@ -393,6 +458,7 @@ class SessionFlightCoordinator:
             flight.last_reply_at = 0.0
             flight.done_event.clear()
             flight.total_runs += 1
+            self._arm_watchdog_locked(flight, policy.max_flight_seconds)
             return AdmissionResult(mode="run_now", token=token)
 
     async def wait_idle_and_promote(
@@ -451,14 +517,13 @@ class SessionFlightCoordinator:
                 flight.last_reply_at = 0.0
                 flight.done_event.clear()
                 flight.total_runs += 1
+                self._arm_watchdog_locked(flight, policy.max_flight_seconds)
                 batch = BurstBatch(items=items, last_reply_preview="", flushed_at=self._clock()) if len(items) > 1 else None
                 return (token, batch)
         except BaseException:
-            flight = self._flights.get(umo)
-            if flight is not None and flight.idle_leader_token == leader_token:
-                flight.idle_active = False
-                flight.idle_leader_token = ""
-                flight.idle_items = []
+            # Roll back under the coordinator lock so a cancelled leader never
+            # leaves a half-reset idle window behind.
+            await self._drop_idle_leader(umo, leader_token)
             raise
 
     async def wait_and_collect_flush(
@@ -475,21 +540,15 @@ class SessionFlightCoordinator:
                     flight = self._get(umo)
                     if flight.waiter_token != waiter_token:
                         return ("", None)
-                    self._check_watchdog_locked(flight, policy.max_flight_seconds)
                     if not flight.in_flight:
                         break
-                    wait_timeout = max(0.05, policy.max_flight_seconds - (self._clock() - flight.started_at))
-                try:
-                    await asyncio.wait_for(flight.done_event.wait(), timeout=wait_timeout)
-                except asyncio.TimeoutError:
-                    continue
+                    # Boundary wait only: this turn's own watchdog is the single
+                    # authority on when a stalled flight gets released.
+                    done_event = flight.done_event
+                await done_event.wait()
 
             if self._closed:
-                flight = self._flights.get(umo)
-                if flight is not None and flight.waiter_token == waiter_token:
-                    flight.waiter_token = ""
-                    flight.settling = False
-                    flight.burst_items = []
+                await self._drop_waiter(umo, waiter_token)
                 return ("", None)
 
             # Brief tail settling window after the prior reply finished
@@ -515,10 +574,7 @@ class SessionFlightCoordinator:
             async with self._lock:
                 flight = self._get(umo)
                 if self._closed or flight.waiter_token != waiter_token:
-                    if flight.waiter_token == waiter_token:
-                        flight.waiter_token = ""
-                        flight.settling = False
-                        flight.burst_items = []
+                    self._drop_waiter_locked(flight, waiter_token)
                     return ("", None)
                 items = tuple(flight.burst_items)
                 flight.burst_items = []
@@ -545,6 +601,7 @@ class SessionFlightCoordinator:
                 flight.llm_started = False
                 flight.done_event.clear()
                 flight.total_runs += 1
+                self._arm_watchdog_locked(flight, policy.max_flight_seconds)
                 batch = BurstBatch(
                     items=items,
                     last_reply_preview=preview,
@@ -552,11 +609,7 @@ class SessionFlightCoordinator:
                 )
                 return (new_token, batch)
         except BaseException:
-            flight = self._flights.get(umo)
-            if flight is not None and flight.waiter_token == waiter_token:
-                flight.waiter_token = ""
-                flight.settling = False
-                flight.burst_items = []
+            await self._drop_waiter(umo, waiter_token)
             raise
 
     async def mark_llm_started(self, umo: str, token: str) -> None:
@@ -584,12 +637,7 @@ class SessionFlightCoordinator:
                 return False
             if token and flight.flight_token != token:
                 return False
-            flight.in_flight = False
-            flight.flight_token = ""
-            flight.llm_started = False
-            if flight.waiter_token:
-                flight.settling = True
-            flight.done_event.set()
+            self._release_locked(flight)
             return True
 
     async def force_release(self, umo: str) -> bool:
@@ -609,6 +657,7 @@ class SessionFlightCoordinator:
                 "settling": False,
                 "idle_active": False,
                 "has_waiter": False,
+                "watchdog_armed": False,
                 "pending_count": 0,
                 "flight_age_seconds": 0.0,
                 "last_reply_preview": "",
@@ -623,6 +672,9 @@ class SessionFlightCoordinator:
             "settling": flight.settling,
             "idle_active": flight.idle_active,
             "has_waiter": bool(flight.waiter_token),
+            "watchdog_armed": bool(
+                flight.watchdog_task and not flight.watchdog_task.done()
+            ),
             "pending_count": len(flight.burst_items),
             "flight_age_seconds": round(max(0.0, self._clock() - flight.started_at), 3) if flight.in_flight else 0.0,
             "last_reply_preview": flight.last_reply_preview,
@@ -647,7 +699,7 @@ class SessionFlightCoordinator:
         self._closed = True
         async with self._lock:
             for flight in self._flights.values():
-                flight.in_flight = False
+                self._release_locked(flight)
                 flight.settling = False
                 flight.idle_active = False
                 flight.burst_items.clear()

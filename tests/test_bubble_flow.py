@@ -914,3 +914,119 @@ def test_idle_preemption_url_cn_punct_dunder_and_tokenless_after_sent() -> None:
             await plugin.terminate()
 
     asyncio.run(_run())
+
+def test_running_turn_ignores_a_shorter_arrival_policy() -> None:
+    """Fix: a burst arrival must not shorten the deadline of the turn already running."""
+
+    async def _run() -> None:
+        plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
+        # Only a full BubblePolicy bypasses BubblePolicy.from_mapping's 5s floor.
+        plugin.extension_api.register_policy_resolver(
+            "fast.arrival",
+            lambda ctx: (
+                BubblePolicy(max_flight_seconds=0.05)
+                if ctx.sender_id == "fast"
+                else None
+            ),
+        )
+        umo = "elle:FriendMessage:4242"
+        try:
+            slow = _FakeEvent(umo, "slow turn")
+            await plugin.handle_interleave_intake(slow)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is True
+            await asyncio.sleep(0.12)
+
+            fast = _FakeEvent(umo, "fast follow-up", sender_id="fast")
+            waiter = asyncio.create_task(plugin.handle_interleave_intake(fast))
+            await asyncio.sleep(0.05)
+
+            state = plugin.extension_api.get_session_state(umo)
+            assert state["in_flight"] is True, "arrival policy must not kill the running turn"
+            assert state["has_waiter"] is True
+            assert state["pending_count"] == 1
+            assert plugin.extension_api.get_stats()["total_watchdog_resets"] == 0
+
+            await plugin.on_after_message_sent(slow)
+            await waiter
+            assert fast.is_stopped() is False
+            assert fast.message_str == "fast follow-up"
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())
+
+
+def test_coordinator_watchdog_is_the_single_timeout_authority() -> None:
+    """Fix: one timer per flight, armed from its own policy, cancelled on release."""
+
+    async def _run() -> None:
+        expired: list[tuple[str, str, float]] = []
+
+        async def _on_expired(umo: str, token: str, timeout: float) -> None:
+            expired.append((umo, token, timeout))
+
+        umo = "elle:FriendMessage:5151"
+        coord = SessionFlightCoordinator(on_flight_expired=_on_expired)
+        policy = BubblePolicy(max_flight_seconds=0.05)
+        try:
+            adm = await coord.admit_or_coalesce(
+                umo, CapturedMessage("hi", coord.clock()), policy=policy
+            )
+            assert adm.mode == "run_now"
+            assert coord.snapshot(umo)["watchdog_armed"] is True
+
+            await asyncio.sleep(0.12)
+            assert coord.snapshot(umo)["in_flight"] is False
+            assert coord.snapshot(umo)["watchdog_armed"] is False
+            assert coord.snapshot(umo)["total_watchdog_resets"] == 1
+            assert expired == [(umo, adm.token, 0.05)]
+
+            # A turn that finishes in time must never report a watchdog release.
+            adm2 = await coord.admit_or_coalesce(
+                umo, CapturedMessage("again", coord.clock()), policy=policy
+            )
+            assert await coord.release_flight(umo, adm2.token) is True
+            assert coord.snapshot(umo)["watchdog_armed"] is False
+            await asyncio.sleep(0.12)
+            assert expired == [(umo, adm.token, 0.05)]
+            assert coord.snapshot(umo)["total_watchdog_resets"] == 1
+        finally:
+            await coord.close()
+
+    asyncio.run(_run())
+
+
+def test_no_watchdog_configured_still_releases_on_normal_finish() -> None:
+    """Fix: max_flight_seconds=0 disables the timer instead of spinning the waiter."""
+
+    async def _run() -> None:
+        coord = SessionFlightCoordinator()
+        policy = BubblePolicy(max_flight_seconds=0.0)
+        umo = "elle:FriendMessage:6060"
+        try:
+            first = await coord.admit_or_coalesce(
+                umo, CapturedMessage("m1", coord.clock()), policy=policy
+            )
+            assert first.mode == "run_now"
+            assert coord.snapshot(umo)["watchdog_armed"] is False
+
+            second = await coord.admit_or_coalesce(
+                umo, CapturedMessage("m2", coord.clock()), policy=policy
+            )
+            assert second.mode == "wait_flush"
+            waiter = asyncio.create_task(
+                coord.wait_and_collect_flush(umo, second.token, policy=policy)
+            )
+            await asyncio.sleep(0.05)
+            assert not waiter.done()
+
+            assert await coord.release_flight(umo, first.token) is True
+            token, batch = await waiter
+            assert token
+            assert batch is not None and batch.merged_text == "m2"
+            assert await coord.release_flight(umo, token) is True
+        finally:
+            await coord.close()
+
+    asyncio.run(_run())
+
