@@ -300,6 +300,10 @@ class SessionFlightCoordinator:
         self._flights: dict[str, _SessionFlight] = {}
         self._closed = False
 
+    def clock(self) -> float:
+        """Current time on this coordinator's (possibly injected) clock."""
+        return self._clock()
+
     def _get(self, umo: str) -> _SessionFlight:
         flight = self._flights.get(umo)
         if flight is None:

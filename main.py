@@ -1,20 +1,27 @@
-"""AstrBot Star plugin providing generic turn-flight coalescing and bubble shaping."""
+"""AstrBot Star plugin: turn-flight coalescing and multi-bubble pacing.
+
+All state lives in coordinator.SessionFlightCoordinator; all host quirks live in
+compat. This module only wires four AstrBot hooks to them:
+
+    intake      -> admit / swallow / wait, then publish the merged batch
+    llm_request -> mark the turn active, merge images, inject the batch hint
+    decorating  -> shape outgoing bubbles, release the lock on terminal states
+    after_sent  -> release the lock once every bubble has been delivered
+"""
 
 from __future__ import annotations
 
-import asyncio
-from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, Image, Plain, Reply
+from astrbot.api.message_components import Plain
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 
+from . import compat
 from .api import (
-    PLUGIN_ID,
     BubbleFilterContext,
     BubbleFlowAPI,
     CoalesceFormatContext,
@@ -23,249 +30,11 @@ from .api import (
 from .coordinator import (
     BubblePolicy,
     BurstBatch,
-    CapturedMessage,
     SessionFlightCoordinator,
-    clean_plain_bubble_text,
     default_coalesce_prompt,
     plan_outgoing_bubbles,
 )
-
-_META_TOKEN = "_bubble_flow_token"
-_META_BATCH = "_bubble_flow_batch"
-_META_POLICY = "_bubble_flow_policy"
-_META_LLM_STARTED = "_bubble_flow_llm_started"
-_META_FOLLOWUP_AFTER_INTERRUPT = "_bubble_flow_followup_after_interrupt"
-
-
-def _set_event_meta(event: Any, key: str, value: Any) -> None:
-    setter = getattr(event, "set_extra", None)
-    if callable(setter):
-        try:
-            setter(key, value)
-        except Exception:
-            pass
-    try:
-        setattr(event, key, value)
-    except Exception:
-        pass
-
-
-def _get_event_meta(event: Any, key: str, default: Any = None) -> Any:
-    getter = getattr(event, "get_extra", None)
-    if callable(getter):
-        try:
-            val = getter(key)
-            if val is not None:
-                return val
-        except Exception:
-            pass
-    return getattr(event, key, default)
-
-
-def _detect_channel_type(event: Any) -> str:
-    is_private = getattr(event, "is_private_chat", None)
-    explicit_non_private = False
-    if callable(is_private):
-        try:
-            res = is_private()
-            if res is True:
-                return "private"
-            if res is False:
-                explicit_non_private = True
-        except Exception:
-            pass
-    msg_type_getter = getattr(event, "get_message_type", None)
-    if callable(msg_type_getter):
-        try:
-            msg_type = msg_type_getter()
-            val = getattr(msg_type, "value", str(msg_type)).lower()
-            if "friend" in val or "private" in val:
-                return "private"
-            if "group" in val:
-                return "group"
-        except Exception:
-            pass
-    if getattr(event, "group_id", None):
-        return "group"
-    umo = str(getattr(event, "unified_msg_origin", "") or "")
-    if ":GroupMessage:" in umo or ":group:" in umo.lower():
-        return "group"
-    if explicit_non_private:
-        return "group"
-    if umo:
-        return "private"
-    return "unknown"
-
-
-def _safe_sender_id(event: Any) -> str:
-    getter = getattr(event, "get_sender_id", None)
-    if callable(getter):
-        try:
-            val = getter()
-            if val is not None:
-                return str(val)
-        except Exception:
-            pass
-    return str(getattr(event, "sender_id", "") or "")
-
-
-def _safe_message_str(event: Any) -> str:
-    getter = getattr(event, "get_message_str", None)
-    if callable(getter):
-        try:
-            val = getter()
-            if val is not None:
-                return str(val).strip()
-        except Exception:
-            pass
-    return str(getattr(event, "message_str", "") or "").strip()
-
-
-def _is_image_component(comp: Any) -> bool:
-    return isinstance(comp, Image) or type(comp).__name__ == "Image"
-
-
-def _is_reply_component(comp: Any) -> bool:
-    return isinstance(comp, Reply) or type(comp).__name__ == "Reply"
-
-
-def _is_plain_component(comp: Any) -> bool:
-    return isinstance(comp, Plain) or type(comp).__name__ == "Plain"
-
-
-def _reply_snippet(comp: Any, limit: int = 80) -> str:
-    raw = getattr(comp, "message_str", None)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:limit]
-    chain = getattr(comp, "chain", None) or []
-    parts = [str(getattr(c, "text", "")) for c in chain if hasattr(c, "text")]
-    joined = "".join(parts).strip()
-    if joined:
-        return joined[:limit]
-    rid = getattr(comp, "id", None)
-    return f"reply:{rid}" if rid else ""
-
-
-def _image_dedup_key(comp: Any) -> tuple[Any, ...]:
-    url = getattr(comp, "url", None) or ""
-    file_val = getattr(comp, "file", None) or ""
-    path_val = getattr(comp, "path", None) or ""
-    if url or file_val or path_val:
-        return (str(url), str(file_val), str(path_val))
-    return ("id", id(comp))
-
-
-def _extract_captured_message(
-    event: Any,
-    policy: BubblePolicy,
-    received_at: float,
-) -> CapturedMessage:
-    text = _safe_message_str(event)
-    sender_id = _safe_sender_id(event)
-    images: list[Any] = []
-    extras: list[Any] = []
-    reply_preview = ""
-
-    msg_obj = getattr(event, "message_obj", None)
-    components = getattr(msg_obj, "message", None) or ()
-    for comp in components:
-        if _is_plain_component(comp):
-            continue
-        if _is_image_component(comp):
-            if policy.coalesce_images:
-                images.append(comp)
-            else:
-                extras.append(comp)
-            continue
-        if _is_reply_component(comp):
-            if not reply_preview:
-                reply_preview = _reply_snippet(comp)
-            extras.append(comp)
-            continue
-        extras.append(comp)
-
-    return CapturedMessage(
-        text=text,
-        received_at=received_at,
-        sender_id=sender_id,
-        reply_preview=reply_preview,
-        image_components=tuple(images),
-        extra_components=tuple(extras),
-        raw_event=event,
-    )
-
-
-def _apply_batch_to_event(event: Any, batch: BurstBatch, policy: BubblePolicy) -> None:
-    merged_text = batch.merged_text
-    if merged_text:
-        try:
-            event.message_str = merged_text
-        except Exception:
-            pass
-
-    msg_obj = getattr(event, "message_obj", None)
-    chain = getattr(msg_obj, "message", None)
-    if not isinstance(chain, list):
-        return
-
-    new_chain: list[Any] = []
-    if merged_text:
-        new_chain.append(Plain(merged_text))
-
-    seen_images: set[tuple[Any, ...]] = set()
-    kept_non_plain: list[Any] = []
-    for comp in chain:
-        if _is_plain_component(comp):
-            continue
-        if _is_image_component(comp):
-            key = _image_dedup_key(comp)
-            if key not in seen_images:
-                seen_images.add(key)
-                kept_non_plain.append(comp)
-        else:
-            kept_non_plain.append(comp)
-
-    if policy.coalesce_images:
-        for img in batch.merged_images:
-            key = _image_dedup_key(img)
-            if key not in seen_images:
-                seen_images.add(key)
-                kept_non_plain.append(img)
-
-    new_chain.extend(kept_non_plain)
-    msg_obj.message = new_chain
-
-
-async def _resolve_image_ref(img: Any) -> str | None:
-    path_val = getattr(img, "path", None)
-    if isinstance(path_val, str) and path_val.strip():
-        return path_val.strip()
-    converter = getattr(img, "convert_to_file_path", None)
-    if callable(converter):
-        try:
-            resolved = await converter()
-            if isinstance(resolved, str) and resolved.strip():
-                return resolved.strip()
-        except Exception:
-            pass
-    for attr in ("url", "file"):
-        val = getattr(img, attr, None)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    return None
-
-
-def _image_ref_norm_keys(ref: str) -> tuple[str, ...]:
-    val = str(ref or "").strip()
-    if not val:
-        return ()
-    keys = [val]
-    if not val.startswith(("http://", "https://", "data:", "base64://")):
-        try:
-            keys.append(str(Path(val).resolve()))
-        except Exception:
-            pass
-    return tuple(keys)
+from .watchdog import FlightWatchdog
 
 
 class BubbleFlowPlugin(Star):
@@ -279,21 +48,31 @@ class BubbleFlowPlugin(Star):
             self.coordinator,
             lambda: BubblePolicy.from_mapping(self.config),
         )
-        self._watchdogs: dict[tuple[str, str], asyncio.Task[Any]] = {}
+        self._watchdog = FlightWatchdog(self._on_watchdog_expired)
+
+    # ------------------------------------------------------------------ #
+    # Turn lifecycle plumbing
+    # ------------------------------------------------------------------ #
+    async def _emit(self, event_name: str, **payload: Any) -> None:
+        await self.extension_api.emit_event(event_name, payload)
 
     def _resolve_event_policy(self, event: Any, umo: str) -> tuple[BubblePolicy, str]:
-        channel_type = _detect_channel_type(event)
-        sender_id = _safe_sender_id(event)
+        channel_type = compat.detect_channel_type(event)
         policy = self.extension_api.resolve_policy(
             PolicyResolveContext(
                 umo=umo,
                 event=event,
                 base_policy=BubblePolicy.from_mapping(self.config),
                 channel_type=channel_type,
-                sender_id=sender_id,
+                sender_id=compat.sender_id(event),
             )
         )
         return policy, channel_type
+
+    def _event_policy(self, event: Any, umo: str) -> BubblePolicy:
+        return compat.read_meta(event, compat.META_POLICY) or (
+            self.extension_api.get_session_policy(umo, event)
+        )
 
     @staticmethod
     def _is_channel_active(policy: BubblePolicy, channel_type: str) -> bool:
@@ -305,61 +84,106 @@ class BubbleFlowPlugin(Star):
             return policy.enable_group
         return policy.enable_private or policy.enable_group
 
-    def _start_watchdog(self, umo: str, token: str, timeout_seconds: float) -> None:
-        if not umo or not token or timeout_seconds <= 0:
+    async def _on_watchdog_expired(
+        self, umo: str, token: str, timeout_seconds: float
+    ) -> None:
+        if not await self.coordinator.release_flight(umo, token):
             return
-        self._cancel_watchdog(umo, token)
-        key = (umo, token)
-
-        async def _watch() -> None:
-            try:
-                await asyncio.sleep(timeout_seconds)
-                released = await self.coordinator.release_flight(umo, token)
-                if released:
-                    logger.warning(
-                        "[BubbleFlow] Watchdog released stalled flight for umo=%s token=%s after %.1fs",
-                        umo,
-                        token,
-                        timeout_seconds,
-                    )
-                    await self.extension_api.emit_event(
-                        "turn.watchdog_released",
-                        {"umo": umo, "token": token, "timeout_seconds": timeout_seconds},
-                    )
-            except asyncio.CancelledError:
-                return
-            finally:
-                if self._watchdogs.get(key) is asyncio.current_task():
-                    self._watchdogs.pop(key, None)
-
-        self._watchdogs[key] = asyncio.create_task(_watch())
-
-    def _cancel_watchdog(self, umo: str, token: str = "") -> None:
-        if token:
-            task = self._watchdogs.pop((umo, token), None)
-            if task and not task.done():
-                task.cancel()
-            return
-        for key in [k for k in self._watchdogs if k[0] == umo]:
-            task = self._watchdogs.pop(key, None)
-            if task and not task.done():
-                task.cancel()
+        logger.warning(
+            "[BubbleFlow] Watchdog released stalled flight for umo=%s token=%s after %.1fs",
+            umo,
+            token,
+            timeout_seconds,
+        )
+        await self._emit(
+            "turn.watchdog_released",
+            umo=umo,
+            token=token,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def _release_turn_slot(
         self, umo: str, token: str, *, empty_result: bool = False
     ) -> None:
-        # Only the turn that owns a flight token may release it. Tokenless
-        # events (upstream call_llm/send_oper handlers, suppressed triggers,
-        # early-skipped intake) must never cancel another turn's flight lock.
+        # Only the turn holding a flight token may release it. Tokenless events
+        # (upstream call_llm/send_oper handlers, suppressed triggers, early-skipped
+        # intake) must never cancel another turn's flight lock.
         if not umo or not token:
             return
-        self._cancel_watchdog(umo, token)
-        released = await self.coordinator.release_flight(umo, token)
-        if released:
-            await self.extension_api.emit_event(
-                "turn.finished",
-                {"umo": umo, "token": token, "empty_result": empty_result},
+        self._watchdog.cancel(umo, token)
+        if await self.coordinator.release_flight(umo, token):
+            await self._emit("turn.finished", umo=umo, token=token, empty_result=empty_result)
+
+    # ------------------------------------------------------------------ #
+    # Hook 1: inbound admission
+    # ------------------------------------------------------------------ #
+    def _admissible_umo(self, event: Any) -> str:
+        """Return the session key when this event should enter the pipeline."""
+        if compat.is_stopped(event):
+            return ""
+        if getattr(event, "call_llm", False) or getattr(event, "_has_send_oper", False):
+            return ""
+        umo = compat.umo(event)
+        if not umo:
+            return ""
+        if self.extension_api.consume_suppressed(event):
+            return ""
+        return umo
+
+    async def _admit(
+        self, event: Any, umo: str, message: Any, policy: BubblePolicy
+    ) -> tuple[str, BurstBatch | None] | None:
+        """Register the message and, when queued, wait for it to be promoted."""
+        admission = await self.coordinator.admit_or_coalesce(umo, message, policy=policy)
+        if admission.mode == "bypass":
+            return None
+        if admission.mode == "swallowed":
+            event.stop_event()
+            await self._emit(
+                "message.swallowed", umo=umo, token=admission.token, text=message.text
             )
+            return None
+
+        token = admission.token
+        batch: BurstBatch | None = None
+        if admission.mode == "wait_idle":
+            await self._emit("burst.debouncing", umo=umo, token=token)
+            token, batch = await self.coordinator.wait_idle_and_promote(
+                umo, token, policy=policy
+            )
+        elif admission.mode == "wait_flush":
+            await self._emit(
+                "turn.interrupted", umo=umo, token=token, text=message.text
+            )
+            token, batch = await self.coordinator.wait_and_collect_flush(
+                umo, token, policy=policy
+            )
+        if not token:
+            event.stop_event()
+            return None
+        return token, batch
+
+    async def _publish_batch(
+        self, event: Any, umo: str, token: str, batch: BurstBatch, policy: BubblePolicy
+    ) -> None:
+        """Expose the merged batch to the LLM turn and announce it."""
+        compat.apply_batch(event, batch, policy)
+        compat.write_meta(event, compat.META_BATCH, batch)
+        if batch.count > 1:
+            logger.info(
+                "[BubbleFlow] Coalesced %d message(s) for %s (images=%d)",
+                batch.count,
+                umo,
+                len(batch.merged_images),
+            )
+        await self._emit(
+            "burst.flushed",
+            umo=umo,
+            token=token,
+            count=batch.count,
+            merged_text=batch.merged_text,
+            image_count=len(batch.merged_images),
+        )
 
     @filter.event_message_type(
         filter.EventMessageType.PRIVATE_MESSAGE | filter.EventMessageType.GROUP_MESSAGE,
@@ -367,237 +191,125 @@ class BubbleFlowPlugin(Star):
     )
     async def handle_interleave_intake(self, event: AstrMessageEvent) -> None:
         """Admit an idle message immediately, debounce, or coalesce mid-flight bursts."""
-        is_stopped = getattr(event, "is_stopped", None)
-        if callable(is_stopped) and is_stopped():
-            return
-        if bool(getattr(event, "call_llm", False)) or bool(getattr(event, "_has_send_oper", False)):
-            return
-
-        umo = getattr(event, "unified_msg_origin", "") or ""
+        umo = self._admissible_umo(event)
         if not umo:
-            return
-
-        if self.extension_api.consume_suppressed(event):
             return
 
         policy, channel_type = self._resolve_event_policy(event, umo)
         if not self._is_channel_active(policy, channel_type):
             return
-        if channel_type == "group" and getattr(event, "is_at_or_wake_command", None) is False:
+        if (
+            channel_type == "group"
+            and getattr(event, "is_at_or_wake_command", None) is False
+        ):
             return
 
-        msg = _extract_captured_message(
-            event, policy, received_at=self.coordinator._clock()
-        )
-        if not msg.text and not msg.image_components and not any(_is_image_component(c) for c in msg.extra_components):
-            return
-        adm = await self.coordinator.admit_or_coalesce(umo, msg, policy=policy)
-        effective_mode = adm.mode
-        effective_token = adm.token
-        batch: BurstBatch | None = None
-
-        if effective_mode == "bypass":
+        message = compat.capture_message(event, policy, self.coordinator.clock())
+        if not compat.has_payload(message):
             return
 
-        if effective_mode == "swallowed":
-            event.stop_event()
-            await self.extension_api.emit_event(
-                "message.swallowed",
-                {"umo": umo, "token": effective_token, "text": msg.text},
-            )
+        admitted = await self._admit(event, umo, message, policy)
+        if admitted is None:
             return
+        token, batch = admitted
 
-        if effective_mode == "wait_idle":
-            await self.extension_api.emit_event(
-                "burst.debouncing", {"umo": umo, "token": effective_token}
-            )
-            promoted_token, batch = await self.coordinator.wait_idle_and_promote(
-                umo, effective_token, policy=policy
-            )
-            if not promoted_token:
-                event.stop_event()
-                return
-            effective_token = promoted_token
-
-        elif effective_mode == "wait_flush":
-            await self.extension_api.emit_event(
-                "turn.interrupted",
-                {"umo": umo, "token": effective_token, "text": msg.text},
-            )
-            promoted_token, batch = await self.coordinator.wait_and_collect_flush(
-                umo, effective_token, policy=policy
-            )
-            if not promoted_token:
-                event.stop_event()
-                return
-            effective_token = promoted_token
-
-        _set_event_meta(event, _META_TOKEN, effective_token)
-        _set_event_meta(event, _META_POLICY, policy)
+        compat.write_meta(event, compat.META_TOKEN, token)
+        compat.write_meta(event, compat.META_POLICY, policy)
         if batch is not None and batch.count > 0:
-            _apply_batch_to_event(event, batch, policy)
-            _set_event_meta(event, _META_BATCH, batch)
-            if batch.count > 1:
-                logger.info(
-                    "[BubbleFlow] Coalesced %d message(s) for %s (images=%d)",
-                    batch.count,
-                    umo,
-                    len(batch.merged_images),
-                )
-            await self.extension_api.emit_event(
-                "burst.flushed",
-                {
-                    "umo": umo,
-                    "token": effective_token,
-                    "count": batch.count,
-                    "merged_text": batch.merged_text,
-                    "image_count": len(batch.merged_images),
-                },
-            )
+            await self._publish_batch(event, umo, token, batch, policy)
 
-        self._start_watchdog(umo, effective_token, policy.max_flight_seconds)
-        await self.extension_api.emit_event(
+        self._watchdog.start(umo, token, policy.max_flight_seconds)
+        await self._emit(
             "turn.started",
-            {
-                "umo": umo,
-                "token": effective_token,
-                "channel_type": channel_type,
-                "coalesced_count": batch.count if batch is not None else 1,
-            },
+            umo=umo,
+            token=token,
+            channel_type=channel_type,
+            coalesced_count=batch.count if batch is not None else 1,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Hook 2: LLM request enrichment
+    # ------------------------------------------------------------------ #
+    async def _merge_batch_images(self, req: ProviderRequest, batch: BurstBatch) -> None:
+        if req.image_urls is None:
+            req.image_urls = []
+        known: set[str] = set()
+        for ref in req.image_urls:
+            known.update(compat.image_ref_keys(ref))
+        for image in batch.merged_images:
+            ref = await compat.resolve_image_ref(image)
+            if not ref:
+                continue
+            keys = compat.image_ref_keys(ref)
+            if any(key in known for key in keys):
+                continue
+            req.image_urls.append(ref)
+            known.update(keys)
+
+    @staticmethod
+    def _needs_coalesce_hint(policy: BubblePolicy, batch: BurstBatch) -> bool:
+        return bool(
+            policy.inject_coalesce_hint
+            and (
+                batch.count > 1
+                or batch.last_reply_preview
+                or len(batch.merged_images) > 1
+            )
         )
 
     @filter.on_llm_request(priority=100)
     async def inject_coalesce_context(
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
-        """Mark LLM turn active and inject merged burst context + images if coalesced."""
-        umo = getattr(event, "unified_msg_origin", "") or ""
-        token = _get_event_meta(event, _META_TOKEN, "")
+        """Mark LLM turn active and inject merged burst context + images."""
+        umo = compat.umo(event)
+        token = compat.read_meta(event, compat.META_TOKEN, "")
         if not umo or not token:
             return
 
-        _set_event_meta(event, _META_LLM_STARTED, True)
+        compat.write_meta(event, compat.META_LLM_STARTED, True)
         await self.coordinator.mark_llm_started(umo, token)
 
-        policy: BubblePolicy = _get_event_meta(event, _META_POLICY) or (
-            self.extension_api.get_session_policy(umo, event)
-        )
-        batch: BurstBatch | None = _get_event_meta(event, _META_BATCH)
+        policy = self._event_policy(event, umo)
+        batch: BurstBatch | None = compat.read_meta(event, compat.META_BATCH)
         if batch is None:
             return
 
         if batch.last_reply_preview:
-            _set_event_meta(event, _META_FOLLOWUP_AFTER_INTERRUPT, True)
+            compat.write_meta(event, compat.META_FOLLOWUP_AFTER_INTERRUPT, True)
 
         if not (req.prompt or "").strip() and batch.merged_text:
             req.prompt = batch.merged_text
 
         if policy.coalesce_images and batch.merged_images:
-            if req.image_urls is None:
-                req.image_urls = []
-            existing_keys: set[str] = set()
-            for r in req.image_urls:
-                existing_keys.update(_image_ref_norm_keys(r))
-            for img in batch.merged_images:
-                ref = await _resolve_image_ref(img)
-                if not ref:
-                    continue
-                norm_keys = _image_ref_norm_keys(ref)
-                if any(k in existing_keys for k in norm_keys):
-                    continue
-                req.image_urls.append(ref)
-                existing_keys.update(norm_keys)
+            await self._merge_batch_images(req, batch)
 
-        if policy.inject_coalesce_hint and (
-            batch.count > 1 or batch.last_reply_preview or len(batch.merged_images) > 1
-        ):
-            hint = self.extension_api.format_coalesce_hint(
-                batch,
-                CoalesceFormatContext(
-                    umo=umo,
-                    event=event,
-                    policy=policy,
-                    batch=batch,
-                ),
-            )
-            if not hint:
-                hint = default_coalesce_prompt(batch)
-            if hint:
-                if req.extra_user_content_parts is None:
-                    req.extra_user_content_parts = []
-                req.extra_user_content_parts.append(TextPart(text=hint))
-
-    @filter.on_decorating_result(priority=-2000000)
-    async def shape_outgoing_bubbles(self, event: AstrMessageEvent) -> None:
-        """Plan, filter, and optionally collapse outgoing text bubbles."""
-        umo = getattr(event, "unified_msg_origin", "") or ""
-        token = _get_event_meta(event, _META_TOKEN, "")
-        if not umo or not token:
+        if not self._needs_coalesce_hint(policy, batch):
             return
-
-        result = getattr(event, "get_result", lambda: None)()
-        rct = getattr(result, "result_content_type", None) if result is not None else None
-        rct_name = str(getattr(rct, "name", "") or rct or "")
-        if "STREAMING_FINISH" in rct_name:
-            await self._release_turn_slot(umo, token, empty_result=False)
-            return
-        if "STREAMING_RESULT" in rct_name:
-            return
-
-        chain = getattr(result, "chain", None) if result is not None else None
-        if result is None or not chain:
-            await self._release_turn_slot(umo, token, empty_result=True)
-            return
-
-        is_model_fn = getattr(result, "is_model_result", None)
-        llm_started = bool(_get_event_meta(event, _META_LLM_STARTED, False))
-        if callable(is_model_fn) and not is_model_fn() and not llm_started:
-            await self._release_turn_slot(umo, token, empty_result=False)
-            return
-
-        policy: BubblePolicy = _get_event_meta(event, _META_POLICY) or (
-            self.extension_api.get_session_policy(umo, event)
+        hint = self.extension_api.format_coalesce_hint(
+            batch,
+            CoalesceFormatContext(umo=umo, event=event, policy=policy, batch=batch),
         )
-        if not policy.enabled:
-            await self._release_turn_slot(umo, token, empty_result=False)
-            return
+        hint = hint or default_coalesce_prompt(batch)
+        if hint:
+            req.extra_user_content_parts = req.extra_user_content_parts or []
+            req.extra_user_content_parts.append(TextPart(text=hint))
 
-        leading_comps: list[Any] = []
-        trailing_comps: list[Any] = []
-        raw_texts: list[str] = []
-        saw_plain = False
-
-        for comp in chain:
-            if _is_plain_component(comp):
-                saw_plain = True
-                text_val = clean_plain_bubble_text(
-                    str(getattr(comp, "text", "") or ""),
-                    strip_markdown=policy.strip_markdown,
-                    strip_trailing_period=policy.strip_trailing_period,
-                    split_on_cn_period=policy.split_on_cn_period,
-                )
-                lines = [ln.strip() for ln in text_val.splitlines() if ln.strip()]
-                if lines:
-                    raw_texts.extend(lines)
-            elif not saw_plain and (
-                isinstance(comp, (Reply, At))
-                or type(comp).__name__ in ("Reply", "At")
-            ):
-                leading_comps.append(comp)
-            else:
-                trailing_comps.append(comp)
-
-        if not raw_texts:
-            await self._release_turn_slot(umo, token, empty_result=False)
-            return
-
-        interrupted = self.coordinator.has_pending_interrupt(umo)
-        effective_policy = (
-            policy.with_overrides({"max_bubbles": 1})
-            if _get_event_meta(event, _META_FOLLOWUP_AFTER_INTERRUPT, False)
-            else policy
+    # ------------------------------------------------------------------ #
+    # Hook 3: outgoing bubble shaping
+    # ------------------------------------------------------------------ #
+    def _plan_bubbles(
+        self,
+        texts: tuple[str, ...],
+        *,
+        policy: BubblePolicy,
+        umo: str,
+        event: Any,
+        interrupted: bool,
+    ) -> list[str]:
+        planned = plan_outgoing_bubbles(
+            list(texts), policy=policy, interrupted=interrupted
         )
-        planned = plan_outgoing_bubbles(raw_texts, policy=effective_policy, interrupted=interrupted)
         planned = self.extension_api.apply_bubble_filters(
             planned,
             BubbleFilterContext(
@@ -605,64 +317,126 @@ class BubbleFlowPlugin(Star):
                 event=event,
                 policy=policy,
                 interrupted=interrupted,
-                raw_bubbles=tuple(raw_texts),
+                raw_bubbles=tuple(texts),
             ),
         )
-        if not planned:
-            planned = [raw_texts[0]]
+        return planned or [texts[0]]
 
-        collapsed = interrupted and policy.collapse_on_interrupt and len(raw_texts) > len(planned)
-        new_chain: list[Any] = [*leading_comps]
-        new_chain.extend(Plain(text) for text in planned)
-        new_chain.extend(trailing_comps)
-        result.chain = new_chain
-
+    async def _record_shaping(
+        self,
+        umo: str,
+        token: str,
+        *,
+        raw_count: int,
+        planned: list[str],
+        policy: BubblePolicy,
+        interrupted: bool,
+    ) -> None:
+        """Record what was actually sent; announce a collapse when bubbles were cut."""
         preview = " / ".join(planned)
+        collapsed = (
+            interrupted and policy.collapse_on_interrupt and raw_count > len(planned)
+        )
         await self.coordinator.record_reply_preview(
             umo, token, preview, collapsed=collapsed
         )
-        if collapsed:
-            logger.info(
-                "[BubbleFlow] Collapsed %d->%d bubble(s) on mid-flight interrupt for %s",
-                len(raw_texts),
-                len(planned),
-                umo,
-            )
-            await self.extension_api.emit_event(
-                "bubbles.collapsed",
-                {
-                    "umo": umo,
-                    "token": token,
-                    "before": len(raw_texts),
-                    "after": len(planned),
-                    "truncated": bool(effective_policy.interrupt_keep_first_only and len(raw_texts) > 1),
-                    "preview": preview[:120],
-                },
-            )
-
-        sent_plain = getattr(event, "get_extra", lambda *_: None)(
-            "_send_message_to_user_current_session_plain_texts", ()
+        if not collapsed:
+            return
+        logger.info(
+            "[BubbleFlow] Collapsed %d->%d bubble(s) on mid-flight interrupt for %s",
+            raw_count,
+            len(planned),
+            umo,
         )
-        result_plain = (
-            result.get_plain_text().strip()
-            if callable(getattr(result, "get_plain_text", None))
-            else ""
+        await self._emit(
+            "bubbles.collapsed",
+            umo=umo,
+            token=token,
+            before=raw_count,
+            after=len(planned),
+            truncated=bool(policy.interrupt_keep_first_only and raw_count > 1),
+            preview=preview[:120],
         )
-        if result_plain and isinstance(sent_plain, list) and result_plain in sent_plain:
-            await self._release_turn_slot(umo, token, empty_result=False)
 
+    @filter.on_decorating_result(priority=-2000000)
+    async def shape_outgoing_bubbles(self, event: AstrMessageEvent) -> None:
+        """Plan, filter, and optionally collapse outgoing text bubbles."""
+        umo = compat.umo(event)
+        token = compat.read_meta(event, compat.META_TOKEN, "")
+        if not umo or not token:
+            return
+
+        result = compat.result_of(event)
+        content_type = compat.content_type_name(result)
+        if "STREAMING_FINISH" in content_type:
+            await self._release_turn_slot(umo, token)
+            return
+        if "STREAMING_RESULT" in content_type:
+            return
+        if result is None or not getattr(result, "chain", None):
+            await self._release_turn_slot(umo, token, empty_result=True)
+            return
+
+        llm_started = bool(compat.read_meta(event, compat.META_LLM_STARTED, False))
+        if compat.is_model_result(result) is False and not llm_started:
+            await self._release_turn_slot(umo, token)
+            return
+
+        policy = self._event_policy(event, umo)
+        if not policy.enabled:
+            await self._release_turn_slot(umo, token)
+            return
+
+        plan = compat.partition_chain(result.chain, policy)
+        if not plan.texts:
+            await self._release_turn_slot(umo, token)
+            return
+
+        interrupted = self.coordinator.has_pending_interrupt(umo)
+        # A follow-up answering an interrupted turn never needs more than one
+        # bubble: the user is already waiting for the answer.
+        effective_policy = (
+            policy.with_overrides({"max_bubbles": 1})
+            if compat.read_meta(event, compat.META_FOLLOWUP_AFTER_INTERRUPT, False)
+            else policy
+        )
+        planned = self._plan_bubbles(
+            plan.texts,
+            policy=effective_policy,
+            umo=umo,
+            event=event,
+            interrupted=interrupted,
+        )
+
+        result.chain = [
+            *plan.leading,
+            *(Plain(text) for text in planned),
+            *plan.trailing,
+        ]
+        await self._record_shaping(
+            umo,
+            token,
+            raw_count=len(plan.texts),
+            planned=planned,
+            policy=policy,
+            interrupted=interrupted,
+        )
+
+        if compat.already_sent_plain(event, result):
+            await self._release_turn_slot(umo, token)
+
+    # ------------------------------------------------------------------ #
+    # Hook 4 + teardown
+    # ------------------------------------------------------------------ #
     @filter.after_message_sent(priority=-100)
     async def on_after_message_sent(self, event: AstrMessageEvent) -> None:
         """Release the active turn slot after all segmented bubbles are sent."""
-        umo = getattr(event, "unified_msg_origin", "") or ""
-        token = _get_event_meta(event, _META_TOKEN, "")
-        await self._release_turn_slot(umo, token, empty_result=False)
+        await self._release_turn_slot(
+            compat.umo(event), compat.read_meta(event, compat.META_TOKEN, "")
+        )
 
     async def terminate(self) -> None:
         """Cancel background watchdogs and release coordinator resources."""
-        for task in list(self._watchdogs.values()):
-            if not task.done():
-                task.cancel()
-        self._watchdogs.clear()
+        self._watchdog.close()
         await self.coordinator.close()
         self.extension_api.clear_registrations()
