@@ -842,3 +842,67 @@ def test_settling_window_race_cancellation_cleanup_and_streaming_release() -> No
             await plugin.terminate()
 
     asyncio.run(_run())
+
+
+def test_idle_preemption_url_cn_punct_dunder_and_tokenless_after_sent() -> None:
+    from astrbot_plugin_bubble_flow import clean_plain_bubble_text
+
+    # 1. URL followed immediately by Chinese period & dunder identifiers
+    assert (
+        clean_plain_bubble_text(
+            "看这个 https://example.com/a。很好笑",
+            strip_markdown=True,
+            strip_trailing_period=True,
+            split_on_cn_period=True,
+        )
+        == "看这个 https://example.com/a\n很好笑"
+    )
+    assert (
+        clean_plain_bubble_text(
+            "看这个 https://example.com/a。",
+            strip_trailing_period=True,
+        )
+        == "看这个 https://example.com/a"
+    )
+    assert (
+        clean_plain_bubble_text(
+            "修改 __init__ 和 __main__ 以及 **加粗**",
+            strip_markdown=True,
+        )
+        == "修改 __init__ 和 __main__ 以及 加粗"
+    )
+
+    # 2. Idle preemption: m2 with debounce=0 joins active idle window instead of stealing flight
+    async def _run() -> None:
+        clk = _FakeClock(3000.0)
+        coord = SessionFlightCoordinator(clock=clk)
+        pol_idle = BubblePolicy(enabled=True, idle_debounce_seconds=0.05)
+        pol_zero = BubblePolicy(enabled=True, idle_debounce_seconds=0.0)
+        umo = "elle:FriendMessage:10086"
+        try:
+            a1 = await coord.admit_or_coalesce(umo, CapturedMessage("m1", clk()), policy=pol_idle)
+            assert a1.mode == "wait_idle"
+            assert coord.snapshot(umo)["idle_active"] is True
+
+            a2 = await coord.admit_or_coalesce(umo, CapturedMessage("m2", clk()), policy=pol_zero)
+            assert a2.mode == "swallowed"
+
+            clk.advance(0.1)
+            tok, batch = await coord.wait_idle_and_promote(umo, a1.token, policy=pol_idle)
+            assert tok != ""
+            assert batch is not None and batch.merged_text == "1. m1\n2. m2"
+            assert coord.snapshot(umo)["idle_active"] is False
+            assert await coord.release_flight(umo, tok) is True
+        finally:
+            await coord.close()
+
+        # 3. Tokenless event in on_after_message_sent is a safe no-op
+        plugin = BubbleFlowPlugin(_FakeContext([]), {"enabled": True})
+        try:
+            ev = _FakeEvent(umo, "无token事件")
+            await plugin.on_after_message_sent(ev)
+            assert plugin.extension_api.get_session_state(umo)["in_flight"] is False
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())

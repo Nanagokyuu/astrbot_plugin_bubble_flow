@@ -13,9 +13,9 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
-_RE_URL = re.compile(r"https?://[^\s\n]+")
+_RE_URL = re.compile(r"https?://[^\s\n。，！？；：、）】》」』\"'<>]+")
 _RE_MD_BOLD_ASTERISK = re.compile(r"\*\*(.+?)\*\*")
-_RE_MD_BOLD_UNDER = re.compile(r"__(.+?)__")
+_RE_MD_BOLD_UNDER = re.compile(r"(?<!\w)__(?![A-Za-z0-9_]+__(?!\w))(.+?)__(?!\w)")
 _RE_MD_INLINE_CODE = re.compile(r"`([^`\n]+)`")
 _RE_MD_HEADING = re.compile(r"(?m)^[ \t]{0,3}#{1,6}[ \t]+")
 _RE_MD_BULLET = re.compile(r"(?m)^[ \t]*[-*+][ \t]+")
@@ -363,13 +363,15 @@ class SessionFlightCoordinator:
                     return AdmissionResult(mode="wait_flush", token=token)
                 return AdmissionResult(mode="swallowed")
 
-            # Case 2: Idle, with optional standalone idle debounce enabled
+            # Case 2: Existing idle debounce window absorbs follow-ups regardless of per-event debounce
+            if flight.idle_active:
+                flight.idle_items.append(message)
+                flight.total_coalesced += 1
+                flight.idle_updated.set()
+                return AdmissionResult(mode="swallowed")
+
+            # Case 3: Idle, with optional standalone idle debounce enabled
             if policy.idle_debounce_seconds > 0:
-                if flight.idle_active:
-                    flight.idle_items.append(message)
-                    flight.total_coalesced += 1
-                    flight.idle_updated.set()
-                    return AdmissionResult(mode="swallowed")
                 token = uuid4().hex
                 flight.idle_active = True
                 flight.idle_leader_token = token
@@ -427,6 +429,9 @@ class SessionFlightCoordinator:
                 if self._closed or not flight.idle_active or flight.idle_leader_token != leader_token:
                     return ("", None)
                 if flight.in_flight or flight.settling:
+                    flight.idle_active = False
+                    flight.idle_leader_token = ""
+                    flight.idle_items = []
                     return ("", None)
                 items = tuple(flight.idle_items)
                 flight.idle_active = False
@@ -597,6 +602,9 @@ class SessionFlightCoordinator:
             return {
                 "umo": umo,
                 "in_flight": False,
+                "settling": False,
+                "idle_active": False,
+                "has_waiter": False,
                 "pending_count": 0,
                 "flight_age_seconds": 0.0,
                 "last_reply_preview": "",
@@ -608,6 +616,9 @@ class SessionFlightCoordinator:
         return {
             "umo": umo,
             "in_flight": flight.in_flight,
+            "settling": flight.settling,
+            "idle_active": flight.idle_active,
+            "has_waiter": bool(flight.waiter_token),
             "pending_count": len(flight.burst_items),
             "flight_age_seconds": round(max(0.0, self._clock() - flight.started_at), 3) if flight.in_flight else 0.0,
             "last_reply_preview": flight.last_reply_preview,
@@ -633,6 +644,7 @@ class SessionFlightCoordinator:
         async with self._lock:
             for flight in self._flights.values():
                 flight.in_flight = False
+                flight.settling = False
                 flight.idle_active = False
                 flight.burst_items.clear()
                 flight.idle_items.clear()

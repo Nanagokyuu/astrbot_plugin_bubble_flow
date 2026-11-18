@@ -632,6 +632,7 @@ class BubbleFlowPlugin(Star):
                     "token": token,
                     "before": len(raw_texts),
                     "after": len(planned),
+                    "truncated": bool(effective_policy.interrupt_keep_first_only and len(raw_texts) > 1),
                     "preview": preview[:120],
                 },
             )

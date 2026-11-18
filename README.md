@@ -19,7 +19,7 @@ When a user sends several consecutive messages (text, images, or reply quotes) w
   - Caps maximum bubbles per turn (`bubbles.max_bubbles`).
   - Merges micro-fragments shorter than `bubbles.min_bubble_chars`.
   - Deduplicates consecutive identical bubbles (`bubbles.dedup_identical_bubbles`).
-  - Collapses remaining output into a single bubble when a mid-flight interrupt is already waiting (`bubbles.collapse_on_interrupt`).
+  - Collapses remaining output into a single bubble (keeping only the first reaction bubble by default via `bubbles.interrupt_keep_first_only`) when a mid-flight interrupt is already waiting (`bubbles.collapse_on_interrupt`).
 - **Reserved Extension API (`bubble-flow.v1`)**:
   - Allows downstream plugins to dynamically tune per-session policies, format coalesce prompts, post-process outgoing bubbles, bypass intake for special triggers, and observe lifecycle events with full callback exception isolation.
 
@@ -37,9 +37,13 @@ When a user sends several consecutive messages (text, images, or reply quotes) w
 | `coalesce` | `coalesce_images` | `bool` | `true` | Preserve and merge mid-flight `Image` components into the next multimodal request. |
 | `bubbles` | `max_bubbles` | `int` | `2` | Maximum outgoing text bubbles retained per turn. |
 | `bubbles` | `collapse_on_interrupt` | `bool` | `true` | Collapse outgoing bubbles into 1 bubble if new user messages arrived mid-flight. |
+| `bubbles` | `interrupt_keep_first_only` | `bool` | `true` | When collapsed on interrupt, keep only the first bubble and drop trailing follow-up sentences. |
 | `bubbles` | `min_bubble_chars` | `int` | `4` | Merge tiny fragments shorter than this length into an adjacent bubble. |
 | `bubbles` | `dedup_identical_bubbles` | `bool` | `true` | Remove consecutive duplicate text bubbles. |
 | `bubbles` | `bubble_sep` | `string` | `"\n"` | Separator used when merging bubbles together. |
+| `bubbles` | `strip_markdown` | `bool` | `false` | Strip common Markdown formatting (`**bold**`, inline code, headings, bullets) for plain-text platforms. |
+| `bubbles` | `strip_trailing_period` | `bool` | `false` | Strip stiff trailing Chinese periods (`。`) at bubble ends while preserving URLs. |
+| `bubbles` | `split_on_cn_period` | `bool` | `false` | Split internal Chinese periods (`。`) into separate bubbles while masking URLs. |
 | `prompts` | `inject_coalesce_hint` | `bool` | `true` | Append a lightweight hint via `req.extra_user_content_parts` when a batch merges multiple items. |
 
 ## Extension API (`bubble-flow.v1`)

@@ -6,6 +6,7 @@ from .coordinator import (
     BurstBatch,
     CapturedMessage,
     SessionFlightCoordinator,
+    clean_plain_bubble_text,
     default_coalesce_prompt,
     plan_outgoing_bubbles,
 )
@@ -18,6 +19,7 @@ __all__ = [
     "BurstBatch",
     "CapturedMessage",
     "SessionFlightCoordinator",
+    "clean_plain_bubble_text",
     "default_coalesce_prompt",
     "discover_bubble_flow_api",
     "plan_outgoing_bubbles",
