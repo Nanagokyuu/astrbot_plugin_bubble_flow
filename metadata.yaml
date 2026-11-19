@@ -1,5 +1,5 @@
 name: astrbot_plugin_bubble_flow
-desc: Generic AstrBot plugin for chat burst coalescing (anti-interleaving) and outgoing multi-bubble rhythm shaping with a versioned extension API (bubble-flow.v1).
-version: 0.1.3
+desc: Generic AstrBot plugin for adaptive burst coalescing, pre-send preemption, and natural multi-bubble pacing (bubble-flow.v1).
+version: 0.2.0
 author: Nanagokyuu
 repo: https://github.com/Nanagokyuu/astrbot_plugin_bubble_flow

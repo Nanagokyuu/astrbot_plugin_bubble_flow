@@ -145,7 +145,13 @@ class BubbleFlowPlugin(Star):
         token = admission.token
         batch: BurstBatch | None = None
         if admission.mode == "wait_idle":
-            await self._emit("burst.debouncing", umo=umo, token=token)
+            await self._emit(
+                "burst.debouncing",
+                umo=umo,
+                token=token,
+                tier=admission.debounce_tier,
+                delay_seconds=admission.debounce_seconds,
+            )
             token, batch = await self.coordinator.wait_idle_and_promote(
                 umo, token, policy=policy
             )
@@ -383,6 +389,30 @@ class BubbleFlowPlugin(Star):
         if not policy.enabled:
             await self._release_turn_slot(umo, token)
             return
+
+        if not compat.already_sent_plain(event, result):
+            decision = await self.coordinator.try_preempt_or_finish(
+                umo,
+                token,
+                policy=policy,
+                channel_type=compat.detect_channel_type(event),
+            )
+            if decision.preempt:
+                result.chain = []
+                logger.info(
+                    "[BubbleFlow] Preempted unpublished turn for %s (round=%d, merged=%d)",
+                    umo,
+                    decision.preempt_round,
+                    decision.merged_count,
+                )
+                await self._emit(
+                    "turn.preempted",
+                    umo=umo,
+                    token=token,
+                    round=decision.preempt_round,
+                    merged_count=decision.merged_count,
+                )
+                return
 
         plan = compat.partition_chain(result.chain, policy)
         if not plan.texts:

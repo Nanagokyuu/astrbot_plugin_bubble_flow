@@ -31,12 +31,19 @@ class BubblePolicy:
     enabled: bool = True
     enable_private: bool = True
     enable_group: bool = False
+    idle_quick_seconds: float = 0.0
     idle_debounce_seconds: float = 0.0
+    idle_continuation_seconds: float = 0.0
+    idle_max_wait_seconds: float = 4.0
     trailing_quiet_seconds: float = 0.6
     trailing_max_wait_seconds: float = 1.8
     max_flight_seconds: float = 45.0
     coalesce_images: bool = True
+    preempt_before_send: bool = False
+    max_preempt_rounds: int = 2
+    enable_preempt_in_group: bool = False
     max_bubbles: int = 2
+    soft_max_bubble_chars: int = 0
     collapse_on_interrupt: bool = True
     interrupt_keep_first_only: bool = True
     min_bubble_chars: int = 4
@@ -61,12 +68,19 @@ class BubblePolicy:
             enabled=bool(raw.get("enabled", True)),
             enable_private=bool(channels.get("enable_private", raw.get("enable_private", True))),
             enable_group=bool(channels.get("enable_group", raw.get("enable_group", False))),
+            idle_quick_seconds=max(0.0, float(coalesce.get("idle_quick_seconds", raw.get("idle_quick_seconds", 0.0)))),
             idle_debounce_seconds=max(0.0, float(coalesce.get("idle_debounce_seconds", raw.get("idle_debounce_seconds", 0.0)))),
+            idle_continuation_seconds=max(0.0, float(coalesce.get("idle_continuation_seconds", raw.get("idle_continuation_seconds", 0.0)))),
+            idle_max_wait_seconds=max(0.2, float(coalesce.get("idle_max_wait_seconds", raw.get("idle_max_wait_seconds", 4.0)))),
             trailing_quiet_seconds=max(0.0, float(coalesce.get("trailing_quiet_seconds", raw.get("trailing_quiet_seconds", 0.6)))),
             trailing_max_wait_seconds=max(0.0, float(coalesce.get("trailing_max_wait_seconds", raw.get("trailing_max_wait_seconds", 1.8)))),
             max_flight_seconds=max(5.0, float(coalesce.get("max_flight_seconds", raw.get("max_flight_seconds", 45.0)))),
             coalesce_images=bool(coalesce.get("coalesce_images", raw.get("coalesce_images", True))),
+            preempt_before_send=bool(coalesce.get("preempt_before_send", raw.get("preempt_before_send", False))),
+            max_preempt_rounds=max(0, int(coalesce.get("max_preempt_rounds", raw.get("max_preempt_rounds", 2)))),
+            enable_preempt_in_group=bool(coalesce.get("enable_preempt_in_group", raw.get("enable_preempt_in_group", False))),
             max_bubbles=max(1, int(bubbles.get("max_bubbles", raw.get("max_bubbles", 2)))),
+            soft_max_bubble_chars=max(0, int(bubbles.get("soft_max_bubble_chars", raw.get("soft_max_bubble_chars", 0)))),
             collapse_on_interrupt=bool(bubbles.get("collapse_on_interrupt", raw.get("collapse_on_interrupt", True))),
             interrupt_keep_first_only=bool(bubbles.get("interrupt_keep_first_only", raw.get("interrupt_keep_first_only", True))),
             min_bubble_chars=max(0, int(bubbles.get("min_bubble_chars", raw.get("min_bubble_chars", 4)))),
@@ -110,6 +124,7 @@ class BurstBatch:
     items: tuple[CapturedMessage, ...]
     last_reply_preview: str = ""
     flushed_at: float = 0.0
+    is_preempted_merge: bool = False
 
     @property
     def count(self) -> int:
@@ -160,6 +175,17 @@ class AdmissionResult:
 
     mode: str  # "run_now" | "wait_idle" | "wait_flush" | "swallowed" | "bypass"
     token: str = ""
+    debounce_tier: str = "none"  # "none" | "quick" | "normal" | "continuation"
+    debounce_seconds: float = 0.0
+
+
+@dataclass(frozen=True)
+class PreemptDecision:
+    """Decision returned before sending outgoing bubbles when mid-flight input arrived."""
+
+    preempt: bool
+    merged_count: int = 0
+    preempt_round: int = 0
 
 
 @dataclass
@@ -173,7 +199,12 @@ class _SessionFlight:
     last_reply_preview: str = ""
     last_reply_at: float = 0.0
     last_activity_at: float = 0.0
+    last_burst_at: float = 0.0
     done_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    active_items: list[CapturedMessage] = field(default_factory=list)
+    preempt_carry_items: list[CapturedMessage] = field(default_factory=list)
+    preempt_count: int = 0
 
     waiter_token: str = ""
     burst_items: list[CapturedMessage] = field(default_factory=list)
@@ -183,19 +214,97 @@ class _SessionFlight:
     idle_items: list[CapturedMessage] = field(default_factory=list)
     idle_updated: asyncio.Event = field(default_factory=asyncio.Event)
     idle_active: bool = False
+    idle_debounce_seconds: float = 0.0
     watchdog_task: asyncio.Task[Any] | None = None
 
     total_runs: int = 0
     total_coalesced: int = 0
     total_collapsed: int = 0
+    total_preempted: int = 0
+    total_fast_passed: int = 0
+    total_continuation_waits: int = 0
     total_watchdog_resets: int = 0
 
     def __post_init__(self) -> None:
         self.done_event.set()
 
 
+_RE_QUICK_COMPLETE = re.compile(
+    r"^(?:早|早安|早上好|午安|晚安|睡了|再见|拜拜|在吗|在不在|嗯+|哦+|好+|行|ok|okay|好的|谢谢|多谢|笑死|哈哈+|[？?]+)$",
+    re.IGNORECASE,
+)
+_RE_CONTINUATION_LEAD = re.compile(
+    r"^(?:我跟你说|跟你说|话说|顺便|对了|还有|就是|其实|但是|不过|然后|那个|等下|等等|刚|刚刚|刚才|em+|呃+|唉|卧槽)"
+)
+_RE_CONTINUATION_TAIL = re.compile(r"(?:然后|就是|因为|所以|但是|不过|或者|而且|[,，、:：…\.]{1,3}|是这样|怎么说)$")
+_RE_TERMINAL_PUNCT = re.compile(r"[。！？!?~～…）)\"”'’」』]$")
+_QUOTE_OPEN_TO_CLOSE = {
+    "「": "」",
+    "『": "』",
+    "（": "）",
+    "(": ")",
+    "《": "》",
+    "【": "】",
+    '"': '"',
+    "'": "'",
+}
+
+
+def classify_debounce_seconds(
+    message: CapturedMessage,
+    policy: BubblePolicy,
+    *,
+    recent_burst: bool = False,
+) -> tuple[str, float]:
+    """Classify an idle inbound message into quick / normal / continuation debounce window."""
+    normal = max(0.0, float(policy.idle_debounce_seconds))
+    quick = max(0.0, float(policy.idle_quick_seconds))
+    cont = max(0.0, float(policy.idle_continuation_seconds))
+
+    if normal <= 0.0 and quick <= 0.0 and cont <= 0.0:
+        return ("none", 0.0)
+
+    # Legacy simple mode: only idle_debounce_seconds was configured
+    if quick <= 0.0 and cont <= 0.0:
+        return ("normal", normal)
+
+    text = (message.text or "").strip()
+    has_image = bool(message.image_components)
+    has_reply = bool(message.reply_preview)
+
+    is_continuation = (
+        recent_burst
+        or (has_image and len(text) <= 8)
+        or has_reply
+        or bool(_RE_CONTINUATION_LEAD.match(text))
+        or bool(_RE_CONTINUATION_TAIL.search(text))
+        or (0 < len(text) <= 10 and not _RE_QUICK_COMPLETE.match(text) and not _RE_TERMINAL_PUNCT.search(text))
+    )
+    if is_continuation and cont > 0.0:
+        return ("continuation", min(cont, policy.idle_max_wait_seconds))
+
+    is_quick = (
+        not has_image
+        and (
+            bool(_RE_QUICK_COMPLETE.match(text))
+            or (len(text) >= 20 and bool(_RE_TERMINAL_PUNCT.search(text)))
+        )
+    )
+    if is_quick:
+        return ("quick", quick)
+
+    return ("normal", normal)
+
+
 def default_coalesce_prompt(batch: BurstBatch) -> str:
     """Build a concise, neutral LLM hint explaining that rapid messages were coalesced."""
+    if batch.is_preempted_merge:
+        lines = [
+            f"[bubble_flow_merged count={batch.count}]",
+            f"对方在短短几秒内连续发来了 {batch.count} 条内容（已按时间顺序合在当前用户消息中）。",
+            "请将它们当作同一段完整发言统一理解，一次性自然回应最新核心意思，不要逐条编号回复。",
+        ]
+        return "\n".join(lines)
     lines = [
         f"[bubble_flow_coalesced count={batch.count}]",
         f"你在处理或刚发完上一句期间，对方紧接着按时间顺序补充发来了 {batch.count} 条内容（已在当前用户消息中按 1..{batch.count} 合并）。",
@@ -204,6 +313,90 @@ def default_coalesce_prompt(batch: BurstBatch) -> str:
     if batch.last_reply_preview:
         lines.append(f"刚才你已经发出去的上一条内容是「{batch.last_reply_preview[:60]}」，不要再重复回答这句。")
     return "\n".join(lines)
+
+
+def split_long_bubble_safely(
+    text: str,
+    *,
+    soft_max_chars: int,
+    max_parts: int,
+    min_chars: int = 4,
+) -> list[str]:
+    """Split an overly long bubble into 2..max_parts chunks at safe top-level punctuation."""
+    raw = str(text or "").strip()
+    if not raw or soft_max_chars <= 0 or len(raw) <= soft_max_chars or max_parts <= 1:
+        return [raw] if raw else []
+    if "```" in raw:
+        return [raw]
+
+    urls: list[str] = []
+
+    def _mask_url(match: re.Match[str]) -> str:
+        urls.append(match.group(0))
+        return f"\x00U{len(urls) - 1}\x00"
+
+    masked = _RE_URL.sub(_mask_url, raw)
+
+    # Walk masked string tracking bracket/quote nesting depth.
+    stack: list[str] = []
+    strong_breaks: list[int] = []
+    comma_breaks: list[int] = []
+    for idx, ch in enumerate(masked):
+        if stack and ch == stack[-1]:
+            stack.pop()
+            continue
+        if ch in _QUOTE_OPEN_TO_CLOSE:
+            # Avoid toggling quotes on English contractions like don't
+            if ch == "'" and idx > 0 and idx + 1 < len(masked) and masked[idx - 1].isalpha() and masked[idx + 1].isalpha():
+                continue
+            stack.append(_QUOTE_OPEN_TO_CLOSE[ch])
+            continue
+        if stack:
+            continue
+        if ch in ("。", "！", "？", "!", "?", "；", ";", "\n"):
+            strong_breaks.append(idx + 1)
+        elif ch in ("，", ","):
+            comma_breaks.append(idx + 1)
+
+    def _unmask(s: str) -> str:
+        out = s.strip()
+        for uidx, url in enumerate(urls):
+            out = out.replace(f"\x00U{uidx}\x00", url)
+        return out
+
+    def _pick_splits(breaks: list[int], min_seg: int) -> list[str] | None:
+        if not breaks:
+            return None
+        parts: list[str] = []
+        start = 0
+        while len(parts) < max_parts - 1:
+            rem = masked[start:].strip()
+            if len(rem) <= soft_max_chars:
+                break
+            target = start + soft_max_chars
+            candidates = [
+                b for b in breaks
+                if b > start + min_seg and len(masked[b:].strip()) >= min_seg
+            ]
+            if not candidates:
+                break
+            # Prefer break at or before soft_max_chars, closest to soft_max_chars
+            before = [b for b in candidates if b <= target]
+            chosen = before[-1] if before else candidates[0]
+            seg = _unmask(masked[start:chosen])
+            if not seg:
+                break
+            parts.append(seg)
+            start = chosen
+        tail = _unmask(masked[start:])
+        if tail:
+            parts.append(tail)
+        return parts if len(parts) > 1 else None
+
+    min_strong = max(4, min_chars)
+    min_comma = max(8, min_chars)
+    result = _pick_splits(strong_breaks, min_strong) or _pick_splits(comma_breaks, min_comma)
+    return result if result else [raw]
 
 
 def plan_outgoing_bubbles(
@@ -231,6 +424,19 @@ def plan_outgoing_bubbles(
                 return [f"{first}{policy.bubble_sep}{cleaned[1]}"]
             return [first]
         return [policy.bubble_sep.join(cleaned)]
+
+    if policy.soft_max_bubble_chars > 0 and policy.max_bubbles > 1:
+        expanded: list[str] = []
+        for item in cleaned:
+            expanded.extend(
+                split_long_bubble_safely(
+                    item,
+                    soft_max_chars=policy.soft_max_bubble_chars,
+                    max_parts=policy.max_bubbles,
+                    min_chars=policy.min_bubble_chars,
+                )
+            )
+        cleaned = expanded
 
     # Merge tiny micro-fragments (< min_bubble_chars) into an adjacent bubble
     if policy.min_bubble_chars > 0 and len(cleaned) > 1:
@@ -386,6 +592,8 @@ class SessionFlightCoordinator:
             flight.waiter_token = ""
             flight.settling = False
             flight.burst_items = []
+            flight.preempt_carry_items = []
+            flight.preempt_count = 0
 
     @staticmethod
     def _drop_idle_locked(flight: _SessionFlight, leader_token: str) -> None:
@@ -419,12 +627,14 @@ class SessionFlightCoordinator:
 
         async with self._lock:
             flight = self._get(umo)
-            flight.last_activity_at = self._clock()
+            now = self._clock()
+            flight.last_activity_at = now
 
             # Case 1: Session currently has an in-flight LLM/send turn (or is settling trailing bursts)
             if flight.in_flight or flight.settling:
                 flight.burst_items.append(message)
                 flight.total_coalesced += 1
+                flight.last_burst_at = now
                 flight.burst_updated.set()
                 if not flight.waiter_token:
                     token = uuid4().hex
@@ -436,30 +646,55 @@ class SessionFlightCoordinator:
             if flight.idle_active:
                 flight.idle_items.append(message)
                 flight.total_coalesced += 1
+                flight.last_burst_at = now
+                _, new_delay = classify_debounce_seconds(message, policy, recent_burst=True)
+                if new_delay > flight.idle_debounce_seconds:
+                    flight.idle_debounce_seconds = new_delay
                 flight.idle_updated.set()
                 return AdmissionResult(mode="swallowed")
 
-            # Case 3: Idle, with optional standalone idle debounce enabled
-            if policy.idle_debounce_seconds > 0:
+            # Case 3: Idle, semantic adaptive debounce
+            recent_burst = flight.last_burst_at > 0 and (now - flight.last_burst_at) <= 15.0
+            tier, delay = classify_debounce_seconds(message, policy, recent_burst=recent_burst)
+            if tier == "quick":
+                flight.total_fast_passed += 1
+            elif tier == "continuation":
+                flight.total_continuation_waits += 1
+
+            if delay > 0:
                 token = uuid4().hex
                 flight.idle_active = True
                 flight.idle_leader_token = token
                 flight.idle_items = [message]
+                flight.idle_debounce_seconds = delay
                 flight.idle_updated.clear()
-                return AdmissionResult(mode="wait_idle", token=token)
+                return AdmissionResult(
+                    mode="wait_idle",
+                    token=token,
+                    debounce_tier=tier,
+                    debounce_seconds=delay,
+                )
 
-            # Case 3: Idle, immediate execution
+            # Case 4: Idle, immediate execution
             token = uuid4().hex
             flight.in_flight = True
             flight.flight_token = token
-            flight.started_at = self._clock()
+            flight.started_at = now
             flight.llm_started = False
             flight.last_reply_preview = ""
             flight.last_reply_at = 0.0
+            flight.active_items = [message]
+            flight.preempt_carry_items = []
+            flight.preempt_count = 0
             flight.done_event.clear()
             flight.total_runs += 1
             self._arm_watchdog_locked(flight, policy.max_flight_seconds)
-            return AdmissionResult(mode="run_now", token=token)
+            return AdmissionResult(
+                mode="run_now",
+                token=token,
+                debounce_tier=tier,
+                debounce_seconds=0.0,
+            )
 
     async def wait_idle_and_promote(
         self,
@@ -475,15 +710,18 @@ class SessionFlightCoordinator:
                 if not flight.idle_active or flight.idle_leader_token != leader_token:
                     return ("", None)
                 first_at = flight.idle_items[0].received_at if flight.idle_items else self._clock()
+                init_delay = flight.idle_debounce_seconds or policy.idle_debounce_seconds
 
-            max_end = self._clock() + min(policy.idle_debounce_seconds * 2.5, max(policy.idle_debounce_seconds, 0.2) + 2.0)
+            max_cap = max(init_delay, policy.idle_max_wait_seconds)
+            max_end = first_at + min(max(init_delay * 2.5, init_delay + 1.5), max_cap)
             while not self._closed:
                 async with self._lock:
                     flight = self._get(umo)
                     if not flight.idle_active or flight.idle_leader_token != leader_token:
                         return ("", None)
                     last_at = flight.idle_items[-1].received_at if flight.idle_items else first_at
-                    quiet_target = last_at + policy.idle_debounce_seconds
+                    eff_delay = flight.idle_debounce_seconds or policy.idle_debounce_seconds
+                    quiet_target = last_at + eff_delay
                     now = self._clock()
                     remaining = min(quiet_target, max_end) - now
                     if remaining <= 0:
@@ -507,24 +745,64 @@ class SessionFlightCoordinator:
                 flight.idle_active = False
                 flight.idle_leader_token = ""
                 flight.idle_items = []
+                flight.idle_debounce_seconds = 0.0
 
                 token = uuid4().hex
+                now = self._clock()
                 flight.in_flight = True
                 flight.flight_token = token
-                flight.started_at = self._clock()
+                flight.started_at = now
                 flight.llm_started = False
                 flight.last_reply_preview = ""
                 flight.last_reply_at = 0.0
+                flight.active_items = list(items)
+                flight.preempt_carry_items = []
+                flight.preempt_count = 0
                 flight.done_event.clear()
                 flight.total_runs += 1
                 self._arm_watchdog_locked(flight, policy.max_flight_seconds)
-                batch = BurstBatch(items=items, last_reply_preview="", flushed_at=self._clock()) if len(items) > 1 else None
+                batch = BurstBatch(items=items, last_reply_preview="", flushed_at=now) if len(items) > 1 else None
                 return (token, batch)
         except BaseException:
             # Roll back under the coordinator lock so a cancelled leader never
             # leaves a half-reset idle window behind.
             await self._drop_idle_leader(umo, leader_token)
             raise
+
+    async def try_preempt_or_finish(
+        self,
+        umo: str,
+        token: str,
+        *,
+        policy: BubblePolicy,
+        channel_type: str = "",
+    ) -> PreemptDecision:
+        """Silently discard an unpublished turn when mid-flight follow-ups arrived."""
+        async with self._lock:
+            flight = self._flights.get(umo)
+            if flight is None or not flight.in_flight or flight.flight_token != token:
+                return PreemptDecision(preempt=False)
+            if not policy.preempt_before_send:
+                return PreemptDecision(preempt=False)
+            if channel_type == "group" and not policy.enable_preempt_in_group:
+                return PreemptDecision(preempt=False)
+            if not flight.burst_items or flight.preempt_count >= policy.max_preempt_rounds:
+                return PreemptDecision(preempt=False)
+
+            flight.preempt_carry_items = [*flight.preempt_carry_items, *flight.active_items]
+            flight.active_items = []
+            flight.preempt_count += 1
+            flight.total_preempted += 1
+            flight.last_reply_preview = ""
+            flight.last_reply_at = 0.0
+            merged_count = len(flight.preempt_carry_items) + len(flight.burst_items)
+            preempt_round = flight.preempt_count
+            self._release_locked(flight)
+            return PreemptDecision(
+                preempt=True,
+                merged_count=merged_count,
+                preempt_round=preempt_round,
+            )
 
     async def wait_and_collect_flush(
         self,
@@ -577,20 +855,30 @@ class SessionFlightCoordinator:
                     self._drop_waiter_locked(flight, waiter_token)
                     return ("", None)
                 items = tuple(flight.burst_items)
+                carry = list(flight.preempt_carry_items)
                 flight.burst_items = []
+                flight.preempt_carry_items = []
                 flight.waiter_token = ""
                 flight.settling = False
                 if not items or flight.in_flight:
                     return ("", None)
 
                 now = self._clock()
-                preview = ""
-                if (
-                    flight.last_reply_preview
-                    and flight.last_reply_at > 0
-                    and (now - flight.last_reply_at) <= max(60.0, policy.max_flight_seconds)
-                ):
-                    preview = flight.last_reply_preview
+                if carry:
+                    combined = (*carry, *items)
+                    is_preempted = True
+                    preview = ""
+                else:
+                    combined = items
+                    is_preempted = False
+                    flight.preempt_count = 0
+                    preview = ""
+                    if (
+                        flight.last_reply_preview
+                        and flight.last_reply_at > 0
+                        and (now - flight.last_reply_at) <= max(60.0, policy.max_flight_seconds)
+                    ):
+                        preview = flight.last_reply_preview
                 flight.last_reply_preview = ""
                 flight.last_reply_at = 0.0
 
@@ -599,13 +887,15 @@ class SessionFlightCoordinator:
                 flight.flight_token = new_token
                 flight.started_at = now
                 flight.llm_started = False
+                flight.active_items = list(combined)
                 flight.done_event.clear()
                 flight.total_runs += 1
                 self._arm_watchdog_locked(flight, policy.max_flight_seconds)
                 batch = BurstBatch(
-                    items=items,
+                    items=combined,
                     last_reply_preview=preview,
                     flushed_at=now,
+                    is_preempted_merge=is_preempted,
                 )
                 return (new_token, batch)
         except BaseException:
@@ -664,6 +954,10 @@ class SessionFlightCoordinator:
                 "total_runs": 0,
                 "total_coalesced": 0,
                 "total_collapsed": 0,
+                "total_preempted": 0,
+                "total_fast_passed": 0,
+                "total_continuation_waits": 0,
+                "preempt_count": 0,
                 "total_watchdog_resets": 0,
             }
         return {
@@ -681,6 +975,10 @@ class SessionFlightCoordinator:
             "total_runs": flight.total_runs,
             "total_coalesced": flight.total_coalesced,
             "total_collapsed": flight.total_collapsed,
+            "total_preempted": flight.total_preempted,
+            "total_fast_passed": flight.total_fast_passed,
+            "total_continuation_waits": flight.total_continuation_waits,
+            "preempt_count": flight.preempt_count,
             "total_watchdog_resets": flight.total_watchdog_resets,
         }
 
@@ -692,6 +990,9 @@ class SessionFlightCoordinator:
             "total_runs": sum(f.total_runs for f in self._flights.values()),
             "total_coalesced": sum(f.total_coalesced for f in self._flights.values()),
             "total_collapsed": sum(f.total_collapsed for f in self._flights.values()),
+            "total_preempted": sum(f.total_preempted for f in self._flights.values()),
+            "total_fast_passed": sum(f.total_fast_passed for f in self._flights.values()),
+            "total_continuation_waits": sum(f.total_continuation_waits for f in self._flights.values()),
             "total_watchdog_resets": sum(f.total_watchdog_resets for f in self._flights.values()),
         }
 
@@ -704,6 +1005,9 @@ class SessionFlightCoordinator:
                 flight.idle_active = False
                 flight.burst_items.clear()
                 flight.idle_items.clear()
+                flight.active_items.clear()
+                flight.preempt_carry_items.clear()
+                flight.preempt_count = 0
                 flight.waiter_token = ""
                 flight.idle_leader_token = ""
                 flight.done_event.set()

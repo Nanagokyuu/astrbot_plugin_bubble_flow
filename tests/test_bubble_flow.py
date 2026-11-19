@@ -1030,3 +1030,122 @@ def test_no_watchdog_configured_still_releases_on_normal_finish() -> None:
 
     asyncio.run(_run())
 
+
+def test_semantic_debounce_classification_tiers() -> None:
+    from astrbot_plugin_bubble_flow.coordinator import classify_debounce_seconds
+
+    pol = BubblePolicy(
+        idle_quick_seconds=0.4,
+        idle_debounce_seconds=1.2,
+        idle_continuation_seconds=2.8,
+        idle_max_wait_seconds=4.0,
+    )
+    assert classify_debounce_seconds(CapturedMessage("早", 0.0), pol) == ("quick", pytest.approx(0.4))
+    assert classify_debounce_seconds(
+        CapturedMessage("今天天气不错我打算下楼买杯冰美式再回来写代码。", 0.0), pol
+    ) == ("quick", pytest.approx(0.4))
+    assert classify_debounce_seconds(
+        CapturedMessage("今天晚饭准备点个黄焖鸡米饭吃", 0.0), pol
+    ) == ("normal", pytest.approx(1.2))
+    assert classify_debounce_seconds(
+        CapturedMessage("我跟你说个事", 0.0), pol
+    ) == ("continuation", pytest.approx(2.8))
+    assert classify_debounce_seconds(
+        CapturedMessage("刚到家", 0.0), pol
+    ) == ("continuation", pytest.approx(2.8))
+    assert classify_debounce_seconds(
+        CapturedMessage("", 0.0, image_components=(object(),)), pol
+    ) == ("continuation", pytest.approx(2.8))
+    assert classify_debounce_seconds(
+        CapturedMessage("今天晚饭准备点个黄焖鸡米饭吃", 0.0), pol, recent_burst=True
+    ) == ("continuation", pytest.approx(2.8))
+
+
+def test_preempt_before_send_merges_and_respects_cap() -> None:
+    async def _run() -> None:
+        plugin = BubbleFlowPlugin(
+            _FakeContext([]),
+            {
+                "enabled": True,
+                "coalesce": {
+                    "idle_quick_seconds": 0.0,
+                    "idle_debounce_seconds": 0.0,
+                    "idle_continuation_seconds": 0.0,
+                    "trailing_quiet_seconds": 0.02,
+                    "trailing_max_wait_seconds": 0.05,
+                    "preempt_before_send": True,
+                    "max_preempt_rounds": 1,
+                },
+                "bubbles": {"max_bubbles": 3, "bubble_sep": "\n", "collapse_on_interrupt": True},
+            },
+        )
+        events: list[tuple[str, dict[str, Any]]] = []
+        plugin.extension_api.register_event_listener("obs", lambda name, payload: events.append((name, payload)))
+        umo = "test:FriendMessage:8888"
+        try:
+            ev1 = _FakeEvent(umo, "我昨天刷了3小时模块")
+            await plugin.handle_interleave_intake(ev1)
+            assert not ev1.is_stopped()
+            await plugin.inject_coalesce_context(
+                ev1, SimpleNamespace(prompt=ev1.message_str, image_urls=[], extra_user_content_parts=[])
+            )
+
+            ev2 = _FakeEvent(umo, "气死我了")
+            waiter_task = asyncio.create_task(plugin.handle_interleave_intake(ev2))
+            await asyncio.sleep(0.01)
+
+            res1 = MessageEventResult()
+            res1.chain = [Plain("刷模块确实看运气")]
+            ev1.set_result(res1)
+            await plugin.shape_outgoing_bubbles(ev1)
+            assert res1.chain == []
+            assert any(name == "turn.preempted" for name, _ in events)
+
+            await waiter_task
+            assert not ev2.is_stopped()
+            assert "我昨天刷了3小时模块" in ev2.message_str
+            assert "气死我了" in ev2.message_str
+            batch2 = getattr(ev2, "_bubble_flow_batch", None)
+            assert batch2 is not None
+            assert batch2.is_preempted_merge is True
+            assert batch2.last_reply_preview == ""
+            req2 = SimpleNamespace(prompt=ev2.message_str, image_urls=[], extra_user_content_parts=[])
+            await plugin.inject_coalesce_context(ev2, req2)
+            assert req2.extra_user_content_parts
+
+            ev3 = _FakeEvent(umo, "😡")
+            waiter_task3 = asyncio.create_task(plugin.handle_interleave_intake(ev3))
+            await asyncio.sleep(0.01)
+
+            res2 = MessageEventResult()
+            res2.chain = [Plain("这也太惨了"), Plain("抱抱你")]
+            ev2.set_result(res2)
+            await plugin.shape_outgoing_bubbles(ev2)
+            assert len(res2.chain) == 1
+            assert res2.chain[0].text == "这也太惨了"
+            await plugin.on_after_message_sent(ev2)
+            await waiter_task3
+            assert plugin.extension_api.get_stats()["total_preempted"] == 1
+        finally:
+            await plugin.terminate()
+
+    asyncio.run(_run())
+
+
+def test_safe_long_bubble_splitting_preserves_urls_and_quotes() -> None:
+    from astrbot_plugin_bubble_flow.coordinator import split_long_bubble_safely
+
+    long_text = "我刚点开你发的 https://example.com/a/b?x=1 看了半天，结果发现「里面写的东西，其实还挺有意思的」，害我差点直接笑出声。"
+    parts = plan_outgoing_bubbles(
+        [long_text],
+        policy=BubblePolicy(max_bubbles=3, soft_max_bubble_chars=36, min_bubble_chars=4, bubble_sep="\n"),
+    )
+    assert 2 <= len(parts) <= 3
+    joined = "".join(parts)
+    assert "https://example.com/a/b?x=1" in joined
+    assert any("「里面写的东西，其实还挺有意思的」" in p for p in parts)
+
+    code = "```python\n" + ("print('hello')\n" * 6) + "```"
+    assert split_long_bubble_safely(code, soft_max_chars=20, max_parts=3) == [code]
+
+

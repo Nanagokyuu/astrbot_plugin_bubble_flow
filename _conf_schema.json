@@ -26,35 +26,71 @@
     "description": "入站连发合批与防交错配置",
     "type": "object",
     "items": {
-      "idle_debounce_seconds": {
-        "description": "空闲首条短防抖（秒）",
-        "hint": "设为 0 表示交由宿主或上游插件（如 Companion）先防抖，本插件只拦截飞行期间的新插话；无前置防抖插件时建议设为 1.0~1.5。",
+      "idle_quick_seconds": {
+        "description": "完整短句快通防抖（秒）",
+        "hint": "对“早/在吗/晚安/？”或带句末标点的完整长句使用极短等待，保持秒回感；无前置防抖插件时建议 0.4，有 Companion 等前置防抖时可覆盖为 0.0。",
         "type": "float",
-        "default": 0.0
+        "default": 0.4
+      },
+      "idle_debounce_seconds": {
+        "description": "普通短句防抖（秒）",
+        "hint": "兜住手速较快的 1~2 秒连发；有前置防抖插件时可覆盖为 0.2。",
+        "type": "float",
+        "default": 1.2
+      },
+      "idle_continuation_seconds": {
+        "description": "未完待续延长防抖（秒）",
+        "hint": "检测到纯图片、引用、引子词（我跟你说/刚刚/但是）或无标点半截短句时自动延长等待。",
+        "type": "float",
+        "default": 2.8
+      },
+      "idle_max_wait_seconds": {
+        "description": "空闲防抖最长等待上限（秒）",
+        "hint": "无论对方连续发多少条，到达该上限立即进入思考，防止无限续期。",
+        "type": "float",
+        "default": 4.0
       },
       "trailing_quiet_seconds": {
         "description": "在途合批尾音等待（秒）",
-        "hint": "上一轮回复发完后，略微等待用户是否还在补充下一句再合并进入同一轮 LLM。",
+        "hint": "上一轮回复结束或触发抢占后，略微等待用户是否还在补充下一句再合并进入同一轮 LLM。",
         "type": "float",
-        "default": 0.6
+        "default": 0.9
       },
       "trailing_max_wait_seconds": {
         "description": "在途合批最长总等待（秒）",
-        "hint": "无论用户继续连敲多少句，上一轮结束后最多再等这么久即强制并包放行。",
+        "hint": "无论用户继续连敲多少句，最多再等这么久即强制并包放行。",
         "type": "float",
-        "default": 1.8
+        "default": 2.4
       },
       "max_flight_seconds": {
         "description": "单轮飞行锁超时兜底（秒）",
         "hint": "防止模型或下游发送异常导致会话永久卡死。",
         "type": "float",
-        "default": 45.0
+        "default": 90.0
       },
       "coalesce_images": {
         "description": "合批时无损合并图片与引用片段",
         "hint": "开启后，在途期间发来的文字、图片和引用消息按原序合并进同一轮多模态请求，防止图片抢跑错位。",
         "type": "bool",
         "default": true
+      },
+      "preempt_before_send": {
+        "description": "思考期无声抢占重规划",
+        "hint": "LLM 思考期间（尚未发出任何气泡）若对方补发新消息，静默作废过时草稿并合批重跑唯一一轮，彻底消除先抢答后补答的割裂感。",
+        "type": "bool",
+        "default": true
+      },
+      "max_preempt_rounds": {
+        "description": "单次连发最大连续抢占次数",
+        "hint": "防止用户持续刷屏导致一直重想不回复；达到上限后正常发出当前轮。",
+        "type": "int",
+        "default": 2
+      },
+      "enable_preempt_in_group": {
+        "description": "群聊是否开启思考期抢占",
+        "hint": "群聊多人发言频率较高，建议默认关闭。",
+        "type": "bool",
+        "default": false
       }
     }
   },
@@ -66,7 +102,13 @@
         "description": "单轮回复最多保留的气泡段数",
         "hint": "超过该段数的后续文本会优雅并入最后一段，减少刷屏和被插话概率。",
         "type": "int",
-        "default": 2
+        "default": 3
+      },
+      "soft_max_bubble_chars": {
+        "description": "单气泡软上限长度（字，0 表示不拆）",
+        "hint": "超过该长度时在安全标点/呼吸停顿处拆成 2~max_bubbles 个短气泡（自动保护 URL 与引号内容）。",
+        "type": "int",
+        "default": 44
       },
       "collapse_on_interrupt": {
         "description": "检测到在途插话时立即折叠为单气泡",
