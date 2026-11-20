@@ -91,6 +91,24 @@
         "hint": "群聊多人发言频率较高，建议默认关闭。",
         "type": "bool",
         "default": false
+      },
+      "preempt_grace_seconds": {
+        "description": "抢占重跑前的短尾音缓冲（秒）",
+        "hint": "思考期触发静默抢占后，重新进入 LLM 前额外等待的尾音缓冲，避免刚合并第 1+2 句又立刻撞上第 3 句。",
+        "type": "float",
+        "default": 0.8
+      },
+      "adaptive_cadence": {
+        "description": "自适应对方打字节奏（EMA）",
+        "hint": "根据同一会话近期连发间隔自动弹性放宽/收紧等待窗口，慢速分句用户输入更不易被打断。",
+        "type": "bool",
+        "default": true
+      },
+      "send_typing_action": {
+        "description": "思考期间向平台发送「正在输入中…」状态",
+        "hint": "在支持输入态的平台（如 Telegram）思考期间每 4 秒刷新一次 typing 状态，减少对方因等待而焦急补发；不支持的平台自动忽略。",
+        "type": "bool",
+        "default": true
       }
     }
   },

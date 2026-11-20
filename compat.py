@@ -379,3 +379,27 @@ def already_sent_plain(event: Any, result: Any) -> bool:
     except Exception:
         return False
     return bool(plain and plain in sent)
+
+
+async def send_typing_indicator(event: Any) -> bool:
+    """Best-effort, exception-isolated typing indicator for platforms that support it (e.g. Telegram)."""
+    if event is None:
+        return False
+    try:
+        # 1. Telegram adapter exposes event.bot.send_chat_action(chat_id, "typing")
+        bot = getattr(event, "bot", None)
+        send_action = getattr(bot, "send_chat_action", None)
+        if callable(send_action):
+            msg_obj = getattr(event, "message_obj", None)
+            raw_msg = getattr(msg_obj, "raw_message", None)
+            chat_id = (
+                getattr(getattr(raw_msg, "chat", None), "id", None)
+                or _call(event, "get_group_id")
+                or _call(event, "get_sender_id")
+            )
+            if chat_id:
+                await send_action(chat_id=chat_id, action="typing")
+                return True
+    except Exception:
+        return False
+    return False

@@ -42,6 +42,9 @@ class BubblePolicy:
     preempt_before_send: bool = False
     max_preempt_rounds: int = 2
     enable_preempt_in_group: bool = False
+    preempt_grace_seconds: float = 0.0
+    adaptive_cadence: bool = True
+    send_typing_action: bool = False
     max_bubbles: int = 2
     soft_max_bubble_chars: int = 0
     collapse_on_interrupt: bool = True
@@ -79,6 +82,9 @@ class BubblePolicy:
             preempt_before_send=bool(coalesce.get("preempt_before_send", raw.get("preempt_before_send", False))),
             max_preempt_rounds=max(0, int(coalesce.get("max_preempt_rounds", raw.get("max_preempt_rounds", 2)))),
             enable_preempt_in_group=bool(coalesce.get("enable_preempt_in_group", raw.get("enable_preempt_in_group", False))),
+            preempt_grace_seconds=max(0.0, float(coalesce.get("preempt_grace_seconds", raw.get("preempt_grace_seconds", 0.0)))),
+            adaptive_cadence=bool(coalesce.get("adaptive_cadence", raw.get("adaptive_cadence", True))),
+            send_typing_action=bool(coalesce.get("send_typing_action", raw.get("send_typing_action", False))),
             max_bubbles=max(1, int(bubbles.get("max_bubbles", raw.get("max_bubbles", 2)))),
             soft_max_bubble_chars=max(0, int(bubbles.get("soft_max_bubble_chars", raw.get("soft_max_bubble_chars", 0)))),
             collapse_on_interrupt=bool(bubbles.get("collapse_on_interrupt", raw.get("collapse_on_interrupt", True))),
@@ -215,6 +221,7 @@ class _SessionFlight:
     idle_updated: asyncio.Event = field(default_factory=asyncio.Event)
     idle_active: bool = False
     idle_debounce_seconds: float = 0.0
+    ema_burst_gap: float = 0.0
     watchdog_task: asyncio.Task[Any] | None = None
 
     total_runs: int = 0
@@ -234,9 +241,9 @@ _RE_QUICK_COMPLETE = re.compile(
     re.IGNORECASE,
 )
 _RE_CONTINUATION_LEAD = re.compile(
-    r"^(?:我跟你说|跟你说|话说|顺便|对了|还有|就是|其实|但是|不过|然后|那个|等下|等等|刚|刚刚|刚才|em+|呃+|唉|卧槽)"
+    r"^(?:我跟你说|跟你说|话说|顺便|对了|还有|就是|其实|但是|不过|然后|结果|关键是|重点是|那个|等下|等等|刚|刚刚|刚才|今天早上|今天上午|今天下午|今天晚上|昨天晚上|em+|呃+|唉|卧槽)"
 )
-_RE_CONTINUATION_TAIL = re.compile(r"(?:然后|就是|因为|所以|但是|不过|或者|而且|[,，、:：…\.]{1,3}|是这样|怎么说)$")
+_RE_CONTINUATION_TAIL = re.compile(r"(?:然后|结果|就是|因为|所以|但是|不过|或者|而且|[,，、:：…\.]{1,3}|是这样|怎么说|点半|分钟|的时候)$")
 _RE_TERMINAL_PUNCT = re.compile(r"[。！？!?~～…）)\"”'’」』]$")
 _QUOTE_OPEN_TO_CLOSE = {
     "「": "」",
@@ -250,11 +257,28 @@ _QUOTE_OPEN_TO_CLOSE = {
 }
 
 
+def _has_unclosed_enclosure(text: str) -> bool:
+    """Return True when Chinese/ASCII brackets or quotes are opened without matching close."""
+    stack: list[str] = []
+    for ch in str(text or ""):
+        if stack and ch == stack[-1]:
+            stack.pop()
+        elif ch in _QUOTE_OPEN_TO_CLOSE:
+            if ch in ('"', "'") and stack and stack[-1] == ch:
+                stack.pop()
+            else:
+                stack.append(_QUOTE_OPEN_TO_CLOSE[ch])
+        elif ch in _QUOTE_OPEN_TO_CLOSE.values() and stack and ch == stack[-1]:
+            stack.pop()
+    return bool(stack)
+
+
 def classify_debounce_seconds(
     message: CapturedMessage,
     policy: BubblePolicy,
     *,
     recent_burst: bool = False,
+    ema_burst_gap: float = 0.0,
 ) -> tuple[str, float]:
     """Classify an idle inbound message into quick / normal / continuation debounce window."""
     normal = max(0.0, float(policy.idle_debounce_seconds))
@@ -276,12 +300,16 @@ def classify_debounce_seconds(
         recent_burst
         or (has_image and len(text) <= 8)
         or has_reply
+        or _has_unclosed_enclosure(text)
         or bool(_RE_CONTINUATION_LEAD.match(text))
         or bool(_RE_CONTINUATION_TAIL.search(text))
         or (0 < len(text) <= 10 and not _RE_QUICK_COMPLETE.match(text) and not _RE_TERMINAL_PUNCT.search(text))
     )
     if is_continuation and cont > 0.0:
-        return ("continuation", min(cont, policy.idle_max_wait_seconds))
+        eff_cont = cont
+        if policy.adaptive_cadence and ema_burst_gap > 0.0:
+            eff_cont = max(cont, min(policy.idle_max_wait_seconds, ema_burst_gap * 0.72))
+        return ("continuation", min(eff_cont, policy.idle_max_wait_seconds))
 
     is_quick = (
         not has_image
@@ -630,6 +658,12 @@ class SessionFlightCoordinator:
             now = self._clock()
             flight.last_activity_at = now
 
+            # Record EMA burst gap when consecutive messages arrive within 0.5s .. 12.0s
+            if flight.last_burst_at > 0:
+                gap = now - flight.last_burst_at
+                if 0.5 <= gap <= 12.0:
+                    flight.ema_burst_gap = gap if flight.ema_burst_gap <= 0.0 else (0.65 * flight.ema_burst_gap + 0.35 * gap)
+
             # Case 1: Session currently has an in-flight LLM/send turn (or is settling trailing bursts)
             if flight.in_flight or flight.settling:
                 flight.burst_items.append(message)
@@ -655,7 +689,12 @@ class SessionFlightCoordinator:
 
             # Case 3: Idle, semantic adaptive debounce
             recent_burst = flight.last_burst_at > 0 and (now - flight.last_burst_at) <= 15.0
-            tier, delay = classify_debounce_seconds(message, policy, recent_burst=recent_burst)
+            tier, delay = classify_debounce_seconds(
+                message,
+                policy,
+                recent_burst=recent_burst,
+                ema_burst_gap=flight.ema_burst_gap,
+            )
             if tier == "quick":
                 flight.total_fast_passed += 1
             elif tier == "continuation":
@@ -769,6 +808,24 @@ class SessionFlightCoordinator:
             await self._drop_idle_leader(umo, leader_token)
             raise
 
+    def will_preempt(
+        self,
+        umo: str,
+        token: str,
+        *,
+        policy: BubblePolicy,
+        channel_type: str = "",
+    ) -> bool:
+        """Non-mutating check of whether try_preempt_or_finish would preempt this turn."""
+        flight = self._flights.get(umo)
+        if flight is None or not flight.in_flight or flight.flight_token != token:
+            return False
+        if not policy.preempt_before_send:
+            return False
+        if channel_type == "group" and not policy.enable_preempt_in_group:
+            return False
+        return bool(flight.burst_items) and flight.preempt_count < policy.max_preempt_rounds
+
     async def try_preempt_or_finish(
         self,
         umo: str,
@@ -829,9 +886,18 @@ class SessionFlightCoordinator:
                 await self._drop_waiter(umo, waiter_token)
                 return ("", None)
 
-            # Brief tail settling window after the prior reply finished
-            max_tail_end = self._clock() + max(0.0, policy.trailing_max_wait_seconds)
-            while policy.trailing_quiet_seconds > 0 and not self._closed:
+            # Brief tail settling window after the prior reply finished (or grace window after silent preemption)
+            async with self._lock:
+                _f0 = self._flights.get(umo)
+                has_carry = bool(_f0 and _f0.preempt_carry_items)
+            quiet_win = (
+                max(policy.trailing_quiet_seconds, policy.preempt_grace_seconds)
+                if has_carry
+                else policy.trailing_quiet_seconds
+            )
+            max_tail_cap = max(policy.trailing_max_wait_seconds, quiet_win)
+            max_tail_end = self._clock() + max(0.0, max_tail_cap)
+            while quiet_win > 0 and not self._closed:
                 async with self._lock:
                     flight = self._get(umo)
                     if flight.waiter_token != waiter_token:
@@ -840,7 +906,7 @@ class SessionFlightCoordinator:
                         break
                     now = self._clock()
                     last_at = max(item.received_at for item in flight.burst_items)
-                    remaining = min(last_at + policy.trailing_quiet_seconds, max_tail_end) - now
+                    remaining = min(last_at + quiet_win, max_tail_end) - now
                     if remaining <= 0:
                         break
                     flight.burst_updated.clear()

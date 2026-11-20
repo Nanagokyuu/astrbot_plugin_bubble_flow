@@ -49,6 +49,7 @@ class BubbleFlowPlugin(Star):
             self.coordinator,
             lambda: BubblePolicy.from_mapping(self.config),
         )
+        self._typing_tasks: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
     # Turn lifecycle plumbing
@@ -101,6 +102,33 @@ class BubbleFlowPlugin(Star):
             timeout_seconds=timeout_seconds,
         )
 
+    def _stop_typing_task(self, umo: str) -> None:
+        task = self._typing_tasks.pop(umo, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _start_typing_task(self, umo: str, event: Any, policy: BubblePolicy) -> None:
+        self._stop_typing_task(umo)
+        if not policy.send_typing_action:
+            return
+        import asyncio
+
+        async def _keep_typing() -> None:
+            try:
+                max_sec = min(60.0, max(8.0, float(policy.max_flight_seconds)))
+                deadline = asyncio.get_running_loop().time() + max_sec
+                while asyncio.get_running_loop().time() < deadline:
+                    ok = await compat.send_typing_indicator(event)
+                    if not ok:
+                        return
+                    await asyncio.sleep(4.0)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+
+        self._typing_tasks[umo] = asyncio.create_task(_keep_typing())
+
     async def _release_turn_slot(
         self, umo: str, token: str, *, empty_result: bool = False
     ) -> None:
@@ -109,6 +137,7 @@ class BubbleFlowPlugin(Star):
         # intake) must never cancel another turn's flight lock.
         if not umo or not token:
             return
+        self._stop_typing_task(umo)
         if await self.coordinator.release_flight(umo, token):
             await self._emit("turn.finished", umo=umo, token=token, empty_result=empty_result)
 
@@ -274,6 +303,7 @@ class BubbleFlowPlugin(Star):
         await self.coordinator.mark_llm_started(umo, token)
 
         policy = self._event_policy(event, umo)
+        self._start_typing_task(umo, event, policy)
         batch: BurstBatch | None = compat.read_meta(event, compat.META_BATCH)
         if batch is None:
             return
@@ -398,6 +428,7 @@ class BubbleFlowPlugin(Star):
                 channel_type=compat.detect_channel_type(event),
             )
             if decision.preempt:
+                self._stop_typing_task(umo)
                 result.chain = []
                 logger.info(
                     "[BubbleFlow] Preempted unpublished turn for %s (round=%d, merged=%d)",
@@ -464,5 +495,7 @@ class BubbleFlowPlugin(Star):
 
     async def terminate(self) -> None:
         """Cancel background watchdogs and release coordinator resources."""
+        for umo in list(getattr(self, "_typing_tasks", {})):
+            self._stop_typing_task(umo)
         await self.coordinator.close()
         self.extension_api.clear_registrations()

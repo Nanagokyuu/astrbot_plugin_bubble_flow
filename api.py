@@ -362,6 +362,27 @@ class BubbleFlowAPI:
         """Whether `umo` received new user messages while its current turn was running."""
         return self._coordinator.has_pending_interrupt(umo)
 
+    def will_preempt(self, event: Any) -> bool:
+        """Return True if BubbleFlow is poised to silently preempt this event's draft."""
+        from . import compat
+
+        umo = compat.umo(event)
+        token = compat.read_meta(event, compat.META_TOKEN, "")
+        if not umo or not token:
+            return False
+        result = compat.result_of(event)
+        if compat.already_sent_plain(event, result):
+            return False
+        policy = compat.read_meta(event, compat.META_POLICY) or self.get_session_policy(umo, event)
+        if not policy.enabled:
+            return False
+        return self._coordinator.will_preempt(
+            umo,
+            token,
+            policy=policy,
+            channel_type=compat.detect_channel_type(event),
+        )
+
     def get_stats(self) -> dict[str, int]:
         """Return aggregate coordinator counters."""
         return self._coordinator.stats()
