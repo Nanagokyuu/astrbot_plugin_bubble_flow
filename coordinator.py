@@ -43,6 +43,7 @@ class BubblePolicy:
     max_preempt_rounds: int = 2
     enable_preempt_in_group: bool = False
     preempt_grace_seconds: float = 0.0
+    group_bare_at_wait_seconds: float = 5.0
     adaptive_cadence: bool = True
     send_typing_action: bool = False
     max_bubbles: int = 2
@@ -83,6 +84,7 @@ class BubblePolicy:
             max_preempt_rounds=max(0, int(coalesce.get("max_preempt_rounds", raw.get("max_preempt_rounds", 2)))),
             enable_preempt_in_group=bool(coalesce.get("enable_preempt_in_group", raw.get("enable_preempt_in_group", False))),
             preempt_grace_seconds=max(0.0, float(coalesce.get("preempt_grace_seconds", raw.get("preempt_grace_seconds", 0.0)))),
+            group_bare_at_wait_seconds=max(0.0, float(coalesce.get("group_bare_at_wait_seconds", raw.get("group_bare_at_wait_seconds", 5.0)))),
             adaptive_cadence=bool(coalesce.get("adaptive_cadence", raw.get("adaptive_cadence", True))),
             send_typing_action=bool(coalesce.get("send_typing_action", raw.get("send_typing_action", False))),
             max_bubbles=max(1, int(bubbles.get("max_bubbles", raw.get("max_bubbles", 2)))),
@@ -121,6 +123,7 @@ class CapturedMessage:
     image_components: tuple[Any, ...] = ()
     extra_components: tuple[Any, ...] = ()
     raw_event: Any = None
+    is_bare_at: bool = False
 
 
 @dataclass(frozen=True)
@@ -138,10 +141,13 @@ class BurstBatch:
 
     @property
     def merged_text(self) -> str:
-        distinct_senders = {item.sender_id for item in self.items if item.sender_id}
-        multi_sender = self.count > 1 and len(distinct_senders) > 1
+        effective_items = tuple(item for item in self.items if not item.is_bare_at)
+        if not effective_items:
+            effective_items = self.items
+        distinct_senders = {item.sender_id for item in effective_items if item.sender_id}
+        multi_sender = len(effective_items) > 1 and len(distinct_senders) > 1
         lines: list[str] = []
-        for idx, item in enumerate(self.items, start=1):
+        for idx, item in enumerate(effective_items, start=1):
             parts: list[str] = []
             if item.reply_preview:
                 parts.append(f"[引用:{item.reply_preview[:48]}]")
@@ -151,7 +157,7 @@ class BurstBatch:
                 parts.append("[图片]")
             line = " ".join(parts).strip()
             if line:
-                if self.count == 1:
+                if len(effective_items) == 1:
                     lines.append(line)
                 elif multi_sender and item.sender_id:
                     lines.append(f"{idx}. [{item.sender_id}] {line}")
@@ -280,7 +286,10 @@ def classify_debounce_seconds(
     recent_burst: bool = False,
     ema_burst_gap: float = 0.0,
 ) -> tuple[str, float]:
-    """Classify an idle inbound message into quick / normal / continuation debounce window."""
+    """Classify an idle inbound message into quick / normal / continuation / bare_at debounce window."""
+    if getattr(message, "is_bare_at", False) and policy.group_bare_at_wait_seconds > 0.0:
+        return ("bare_at", float(policy.group_bare_at_wait_seconds))
+
     normal = max(0.0, float(policy.idle_debounce_seconds))
     quick = max(0.0, float(policy.idle_quick_seconds))
     cont = max(0.0, float(policy.idle_continuation_seconds))
@@ -678,11 +687,16 @@ class SessionFlightCoordinator:
 
             # Case 2: Existing idle debounce window absorbs follow-ups regardless of per-event debounce
             if flight.idle_active:
+                was_bare_at_only = bool(flight.idle_items) and all(
+                    item.is_bare_at for item in flight.idle_items
+                )
                 flight.idle_items.append(message)
                 flight.total_coalesced += 1
                 flight.last_burst_at = now
                 _, new_delay = classify_debounce_seconds(message, policy, recent_burst=True)
-                if new_delay > flight.idle_debounce_seconds:
+                if was_bare_at_only and not message.is_bare_at:
+                    flight.idle_debounce_seconds = max(0.2, new_delay)
+                elif new_delay > flight.idle_debounce_seconds:
                     flight.idle_debounce_seconds = new_delay
                 flight.idle_updated.set()
                 return AdmissionResult(mode="swallowed")
@@ -750,8 +764,9 @@ class SessionFlightCoordinator:
                     return ("", None)
                 first_at = flight.idle_items[0].received_at if flight.idle_items else self._clock()
                 init_delay = flight.idle_debounce_seconds or policy.idle_debounce_seconds
+                has_bare_at = any(item.is_bare_at for item in flight.idle_items)
 
-            max_cap = max(init_delay, policy.idle_max_wait_seconds)
+            max_cap = max(init_delay + 2.0 if has_bare_at else init_delay, policy.idle_max_wait_seconds)
             max_end = first_at + min(max(init_delay * 2.5, init_delay + 1.5), max_cap)
             while not self._closed:
                 async with self._lock:

@@ -189,6 +189,8 @@ def capture_message(
     images: list[Any] = []
     extras: list[Any] = []
     reply_preview = ""
+    has_at_self = False
+    self_id = str(_call(event, "get_self_id") or "")
 
     for comp in message_chain(event):
         if is_plain(comp):
@@ -198,16 +200,31 @@ def capture_message(
             continue
         if is_reply(comp) and not reply_preview:
             reply_preview = reply_snippet(comp)
+        if is_at(comp) and self_id and str(getattr(comp, "qq", "") or "") == self_id:
+            has_at_self = True
         extras.append(comp)
 
+    text = message_text(event)
+    is_bare_at = bool(
+        getattr(event, "_bubble_flow_bare_at", False)
+        or (
+            detect_channel_type(event) == "group"
+            and has_at_self
+            and not text
+            and not images
+            and not reply_preview
+        )
+    )
+
     return CapturedMessage(
-        text=message_text(event),
+        text=text,
         received_at=received_at,
         sender_id=sender_id(event),
         reply_preview=reply_preview,
         image_components=tuple(images),
         extra_components=tuple(extras),
         raw_event=event,
+        is_bare_at=is_bare_at,
     )
 
 

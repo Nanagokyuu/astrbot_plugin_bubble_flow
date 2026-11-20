@@ -50,6 +50,7 @@ class BubbleFlowPlugin(Star):
             lambda: BubblePolicy.from_mapping(self.config),
         )
         self._typing_tasks: dict[str, Any] = {}
+        self._pending_bare_at: dict[tuple[str, str], float] = {}
 
     # ------------------------------------------------------------------ #
     # Turn lifecycle plumbing
@@ -231,15 +232,39 @@ class BubbleFlowPlugin(Star):
         policy, channel_type = self._resolve_event_policy(event, umo)
         if not self._is_channel_active(policy, channel_type):
             return
+
+        now_clock = self.coordinator.clock()
+        pending_bare_at = getattr(self, "_pending_bare_at", None)
+        if pending_bare_at is None:
+            pending_bare_at = {}
+            self._pending_bare_at = pending_bare_at
+        sender = compat.sender_id(event)
+        bare_at_key = (umo, sender) if sender else None
+        bare_at_active = False
+        if bare_at_key is not None:
+            deadline = pending_bare_at.get(bare_at_key, 0.0)
+            if deadline > now_clock:
+                bare_at_active = True
+            elif deadline > 0.0:
+                pending_bare_at.pop(bare_at_key, None)
+
         if (
             channel_type == "group"
             and getattr(event, "is_at_or_wake_command", None) is False
+            and not bare_at_active
         ):
             return
 
-        message = compat.capture_message(event, policy, self.coordinator.clock())
+        message = compat.capture_message(event, policy, now_clock)
         if not compat.has_payload(message):
             return
+        if (
+            channel_type == "group"
+            and message.is_bare_at
+            and bare_at_key is not None
+            and policy.group_bare_at_wait_seconds > 0.0
+        ):
+            pending_bare_at[bare_at_key] = now_clock + policy.group_bare_at_wait_seconds
 
         admitted = await self._admit(event, umo, message, policy)
         if admitted is None:

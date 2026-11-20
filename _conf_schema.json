@@ -98,6 +98,12 @@
         "type": "float",
         "default": 0.8
       },
+      "group_bare_at_wait_seconds": {
+        "description": "群聊纯 @ 后续发言等待窗口（秒）",
+        "hint": "群聊中有人只 @ 机器人未打字时，等待该发送者补发后续文字/图片的窗口；窗口内即使未再次 @ 也会合并进本轮；设为 0 关闭。",
+        "type": "float",
+        "default": 5.0
+      },
       "adaptive_cadence": {
         "description": "自适应对方打字节奏（EMA）",
         "hint": "根据同一会话近期连发间隔自动弹性放宽/收紧等待窗口，慢速分句用户输入更不易被打断。",
